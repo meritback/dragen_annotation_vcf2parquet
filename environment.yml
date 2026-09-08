@@ -1,0 +1,10 @@
+name: aggv3-annotations
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - bcftools=1.21
+  - polars=1.*
+  - pyarrow
+  - click

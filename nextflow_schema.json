@@ -1,0 +1,84 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "title": "aggv3-annotations pipeline parameters",
+    "description": "AggV3 VEP-annotated msVCF to long-format annotation parquet, one row per variant per consequence",
+    "type": "object",
+    "definitions": {
+        "input_output_options": {
+            "title": "Input/output options",
+            "type": "object",
+            "required": ["annotation_root", "outdir"],
+            "properties": {
+                "annotation_root": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "description": "Directory containing shard-*/subshard-*/dragen.gel.annotated.vcf.gz",
+                    "help_text": "The dated functional-annotation release, e.g. functional-annotation_2025-12-24. Subshard numbering matches the msVCF tree, so the output joins to the genotype pipeline's merged.parquet on CHROM/POS/REF/ALT. Note the release is versioned: record which date you used, and do not mix releases in one run — the CSQ header defines the column schema and a different VEP cache would give a different one."
+                },
+                "vcf_name": {
+                    "type": "string",
+                    "default": "dragen.gel.annotated.vcf.gz",
+                    "description": "Filename to glob within each subshard directory"
+                },
+                "outdir": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "default": "results",
+                    "description": "Publish directory for parquet output"
+                }
+            }
+        },
+        "subset_options": {
+            "title": "Subsetting",
+            "type": "object",
+            "properties": {
+                "shards": {
+                    "type": "string",
+                    "default": "shard-*",
+                    "description": "Glob selecting shards; use 'shard-1' to pilot"
+                },
+                "subshards": {
+                    "type": "string",
+                    "default": "subshard-*",
+                    "description": "Glob selecting subshards within each shard"
+                }
+            }
+        },
+        "annotation_options": {
+            "title": "Annotation source",
+            "type": "object",
+            "properties": {
+                "annotation_field": {
+                    "type": "string",
+                    "default": "CSQ",
+                    "enum": ["CSQ", "ANN"],
+                    "description": "INFO field to expand into columns",
+                    "help_text": "CSQ is VEP and carries roughly 200 subfields including gnomAD frequencies across every population, SpliceAI, CADD, REVEL, AlphaMissense, ClinVar and LOFTEE. ANN is SnpEff and carries 16. Whichever is not chosen is carried through as a single raw string column, repeated per row, so nothing is lost either way. bcftools +split-vep expands one field per invocation: the two are per-transcript lists of different lengths with no correct pairing between them, so there is no way to explode both at once."
+                }
+            }
+        },
+        "site_filters": {
+            "title": "Site filters (applied during extraction)",
+            "description": "Run in bcftools while reading the VCF, so filtered variants never reach the intermediate TSV. Fast, but baked in: changing a threshold means re-running the conversion.",
+            "type": "object",
+            "properties": {
+                "max_af": {
+                    "type": "number",
+                    "description": "Exclude sites with INFO/AF above this value",
+                    "help_text": "Usually not worth setting here. At AggV3's cohort size (~138k) the site frequency spectrum is dominated by singletons and doubletons, so AF<0.01 retains roughly 97-99% of sites — the filter costs a re-run and saves almost no disk. Filter at query time instead, where the threshold stays changeable. Note AF is calculated across all samples including GIAB."
+                },
+                "max_ac": {
+                    "type": "integer",
+                    "description": "Exclude sites with INFO/AC above this value",
+                    "help_text": "Less stable than max_af: AN varies site to site with missingness, so a fixed AC is a slightly different frequency threshold at each site. No sample subsetting happens in this pipeline, so both refer to the whole cohort."
+                }
+            }
+        }
+    },
+    "allOf": [
+        {"$ref": "#/definitions/input_output_options"},
+        {"$ref": "#/definitions/subset_options"},
+        {"$ref": "#/definitions/annotation_options"},
+        {"$ref": "#/definitions/site_filters"}
+    ]
+}
