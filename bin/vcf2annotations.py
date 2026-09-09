@@ -8,15 +8,29 @@ import os
 import sys
 from polars.exceptions import NoDataError
 
-# VEP-annotated msVCF -> long-format annotation parquet.
+# VEP/SnpEff-annotated msVCF -> long-format annotation parquet, one file per
+# annotation field.
 #
 # paths:
 # base_path  = "/home/vscode/session_data/filesystems/"
 # annotated  = functional-annotation_2025-12-24/shard-{S}/subshard-{U}/dragen.gel.annotated.vcf.gz
 #
-# One row per variant per VEP consequence (i.e. per transcript). Site-level:
-# there is no sample dimension here, so these files are small compared to the
-# genotype parquets despite the ~200 columns.
+# One row per variant per consequence (i.e. per transcript), per field:
+#
+#   annotations_CSQ.parquet   VEP,    ~200 subfield columns, ~40 rows/variant
+#   annotations_ANN.parquet   SnpEff,  16 subfield columns,  ~2 rows/variant
+#
+# Both carry the same fixed key columns and an ID (CHROM:POS:REF:ALT), so they
+# join to each other and to the genotype pipeline's merged.parquet.
+#
+# Why two files rather than one: split-vep expands exactly one field per
+# invocation, and -d multiplies rows by that field's entry count. Carrying the
+# other field along as a raw string in the same pass reprints its entire block
+# on every row -- measured at ~40 CSQ consequences per variant on this release,
+# i.e. 39 redundant copies of ANN through the TSV, the pipe and the parser.
+# The two fields are also per-transcript lists of different lengths with no
+# correct row-wise pairing, so there is no single table that holds both
+# without either duplication or invented correspondences.
 
 BCFTOOLS_PATH = "bcftools"
 
@@ -26,9 +40,9 @@ BCFTOOLS_PATH = "bcftools"
 CHROM_ENUM = pl.Enum([f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM"])
 POS_DTYPE = pl.Int64
 
-# Fixed columns, ahead of the expanded CSQ block. Uppercase, unlike the CSQ
-# subfields below, because these four are the join keys and must match the
-# genotype parquets exactly.
+# Fixed columns, ahead of the expanded subfield block. Uppercase, unlike the
+# subfields below, because the first four are the join keys and must match the
+# genotype parquets exactly. Written identically into every field's file.
 #
 # %ID is deliberately absent: tsv_to_parquet appends its own ID column
 # (CHROM:POS:REF:ALT) and the names would collide. rsIDs are in the CSQ
@@ -37,20 +51,17 @@ FIXED_COLS = ["CHROM", "POS", "REF", "ALT", "QUAL", "FILTER", "AC", "AN", "AF"]
 FIXED_FMT = ("%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER"
              "\t%INFO/AC\t%INFO/AN\t%INFO/AF")
 
-# The annotation field NOT being expanded, carried whole and unparsed as one
-# string column. split-vep expands one field per invocation, and CSQ (VEP) is
-# by far the richer of the two, so ANN (SnpEff) rides along as a raw block
-# repeated on each CSQ row for that variant. Lossless; split it downstream if
-# you need it. ZSTD compresses the repetition to almost nothing.
-CARRY = {"CSQ": "ANN", "ANN": "CSQ"}
+# Names a sanitised subfield must never take, or it would shadow a join key.
+RESERVED = ({c.lower() for c in FIXED_COLS} | set(FIXED_COLS)
+            | {"ID", "id"} | {"csq", "ann", "bcsq", "CSQ", "ANN", "BCSQ"})
 
 # Numeric casts. Everything is read as Utf8 first, so an unexpected value
 # becomes null instead of killing the job halfway through a shard.
 #
-# Only the fixed columns are cast. The CSQ subfields stay Utf8 on purpose:
-# many are multi-valued ("&"-separated per allele or per prediction), VEP
-# writes "" and "." and "-" for missing in different fields, and a strict=False
-# cast would silently null every one of those. Cast at query time with
+# Only the fixed columns are cast. The subfields stay Utf8 on purpose: many
+# are multi-valued ("&"-separated per allele or per prediction), VEP writes
+# "" and "." and "-" for missing in different fields, and a strict=False cast
+# would silently null every one of those. Cast at query time with
 # try_cast/strict=False, where you can see what you lost.
 CASTS = {
     "POS": POS_DTYPE,
@@ -65,12 +76,12 @@ def bcf_to_tsv(bcf_file: str, output_file, format_str: str,
                annotation_field: str = "CSQ",
                view_exclude: str | None = None,
                region: str | None = None) -> None:
-    """Expand the annotation field to TSV, one row per consequence.
+    """Expand one annotation field to TSV, one row per consequence.
 
     -a pins which INFO field is parsed. Without it split-vep auto-detects in
     the order CSQ, BCSQ, ANN and warns when more than one is present -- and
-    this script calls bcftools twice, once for the header and once for the
-    data. If those two calls ever resolved to different fields the column
+    each field is processed by two bcftools calls, once for the header and
+    once for the data. If those two resolved to different fields the column
     names and the values would silently disagree.
 
     -d  one output row per consequence entry
@@ -106,7 +117,7 @@ def bcf_to_tsv(bcf_file: str, output_file, format_str: str,
 
 
 def csq_columns(bcf_file: str, annotation_field: str = "CSQ") -> list:
-    """Column names for the expanded annotation block, in header order.
+    """Column names for one expanded annotation block, in header order.
 
     `split-vep -l` parses the Description= of the INFO field into its subfield
     names. Sanitised to lowercase snake_case, because VEP field names are not
@@ -124,10 +135,7 @@ def csq_columns(bcf_file: str, annotation_field: str = "CSQ") -> list:
     ).stdout
 
     names = []
-    # Reserve the fixed names and the ID column tsv_to_parquet appends, so a
-    # CSQ subfield can never shadow a join key.
-    seen = ({c.lower() for c in FIXED_COLS} | set(FIXED_COLS)
-            | {"ID", "id"} | {k.lower() for k in CARRY} | set(CARRY))
+    seen = set(RESERVED)
     for line in out.splitlines():
         # "<index>\t<name>"; take the name.
         parts = line.split("\t")
@@ -138,9 +146,9 @@ def csq_columns(bcf_file: str, annotation_field: str = "CSQ") -> list:
             continue
         s = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").lower() or "field"
         base, i = s, 1
-        # Distinct VEP fields can sanitise to the same identifier
-        # ('CDS.pos / CDS.length' vs 'CDS_pos_CDS_length'). Suffix rather than
-        # drop: losing a column silently would shift every column after it.
+        # Distinct fields can sanitise to the same identifier ('CDS.pos /
+        # CDS.length' vs 'CDS_pos_CDS_length'). Suffix rather than drop:
+        # losing a column silently would shift every column after it.
         while s in seen:
             i += 1
             s = f"{base}_{i}"
@@ -205,6 +213,38 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
         write_empty_parquet(output_file, column_names)
 
 
+def convert_one_field(bcf_file: str, field: str, out_parquet: str,
+                      columns_file: str | None, site_exclude: str | None,
+                      region: str | None, workdir: str) -> int:
+    """One field -> one parquet. Returns the number of columns written.
+
+    Each field is a self-contained pass: its own header lookup, its own
+    split-vep invocation, its own TSV. Nothing from the other field is in
+    the format string, which is the point of the split.
+    """
+    subfields = csq_columns(bcf_file, field)
+    column_names = list(FIXED_COLS) + subfields
+    format_str = FIXED_FMT + f"\t%{field}\n"
+
+    click.echo(f"[{field}] subfields: {len(subfields)}  "
+               f"total columns: {len(column_names)} (+ID)")
+
+    if columns_file:
+        with open(columns_file, "w") as fh:
+            fh.write("\n".join(column_names) + "\n")
+
+    with tempfile.NamedTemporaryFile(mode="w+b", dir=workdir) as tmp:
+        bcf_to_tsv(bcf_file, tmp, format_str=format_str,
+                   annotation_field=field,
+                   view_exclude=site_exclude,
+                   region=region)
+        tmp.flush()
+        tsv_to_parquet(tmp.name, out_parquet, column_names)
+
+    click.echo(f"[{field}] wrote {out_parquet}")
+    return len(column_names)
+
+
 def check_bcftools():
     if subprocess.call(f"type {BCFTOOLS_PATH}", shell=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
@@ -218,23 +258,36 @@ def check_bcftools():
                  f"{out[:500]}")
 
 
+def parse_fields(fields: str) -> list:
+    out = []
+    for f in fields.split(","):
+        f = f.strip().upper()
+        if f and f not in out:
+            out.append(f)
+    if not out:
+        sys.exit("--fields resolved to nothing")
+    return out
+
+
 @click.group()
 def cli():
-    """VEP-annotated VCF to Parquet converter."""
+    """Annotated VCF to Parquet converter."""
     pass
 
 
 @cli.command("convert_annotations")
 @click.argument("bcf_file", type=click.Path(exists=True))
-@click.argument("output_file", type=click.Path())
-@click.option("--columns-file", type=click.Path(), default=None,
-              help="Write the resolved column list here, one per line. The "
-                   "pipeline collects these and checks every subshard agrees: "
-                   "parquets with different schemas will not concatenate.")
-@click.option("--annotation-field", default="CSQ", show_default=True,
-              help="INFO field to expand. CSQ is VEP; ANN is SnpEff and much "
-                   "thinner. Whichever is not chosen is carried as a raw "
-                   "string column if it is in FIXED_FMT.")
+@click.argument("output_prefix", type=click.Path())
+@click.option("--fields", default="CSQ,ANN", show_default=True,
+              help="Comma-separated INFO fields to expand, one parquet each. "
+                   "CSQ is VEP (~200 subfields); ANN is SnpEff (16). Each is "
+                   "expanded in its own split-vep pass, so neither is "
+                   "duplicated across the other's rows.")
+@click.option("--columns-prefix", type=click.Path(), default=None,
+              help="Write each field's resolved column list to "
+                   "<prefix>_<FIELD>.txt, one name per line. The pipeline "
+                   "collects these and checks every subshard agrees: parquets "
+                   "with different schemas will not concatenate.")
 @click.option("--region", default=None, help="e.g. chr1:1000000-1100000 (testing)")
 @click.option("--max-af", type=float, default=None,
               help="Exclude sites with INFO/AF above this. At AggV3's cohort "
@@ -242,33 +295,21 @@ def cli():
                    "frequency spectrum is dominated by singletons -- so "
                    "filtering at query time is usually the better trade.")
 @click.option("--max-ac", type=int, default=None)
-def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
-                        annotation_field: str, region: str,
+def convert_annotations(bcf_file: str, output_prefix: str, fields: str,
+                        columns_prefix: str, region: str,
                         max_af: float, max_ac: int):
-    """Annotated VCF -> parquet. One row per variant per consequence."""
+    """Annotated VCF -> one parquet per annotation field.
+
+    Writes <output_prefix>_<FIELD>.parquet for each field, e.g.
+    annotations_CSQ.parquet and annotations_ANN.parquet.
+    """
     check_bcftools()
-    click.echo(f"Processing {bcf_file}...")
-
-    carry = CARRY.get(annotation_field)
-    csq = csq_columns(bcf_file, annotation_field)
-
-    column_names = list(FIXED_COLS)
-    format_str = FIXED_FMT
-    if carry:
-        column_names.append(carry)
-        format_str += f"\t%INFO/{carry}"
-    column_names += csq
-    format_str += f"\t%{annotation_field}\n"
-
-    click.echo(f"{annotation_field} subfields: {len(csq)}  "
-               f"total columns: {len(column_names)}")
-
-    if columns_file:
-        with open(columns_file, "w") as fh:
-            fh.write("\n".join(column_names) + "\n")
+    field_list = parse_fields(fields)
+    click.echo(f"Processing {bcf_file}  fields: {', '.join(field_list)}")
 
     # ALT="*" is the spanning-deletion placeholder, not a real allele, and it
-    # carries no meaningful consequence.
+    # carries no meaningful consequence. Applied identically to every field's
+    # pass, so the row sets stay comparable and the IDs join.
     excl = ['ALT="*"']
     if max_af is not None:
         excl.append(f"INFO/AF>{max_af}")
@@ -277,31 +318,39 @@ def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
     site_exclude = " || ".join(excl)
 
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as workdir:
-        with tempfile.NamedTemporaryFile(mode="w+b", dir=workdir) as tmp:
-            bcf_to_tsv(bcf_file, tmp, format_str=format_str,
-                       annotation_field=annotation_field,
-                       view_exclude=site_exclude,
-                       region=region)
-            tmp.flush()
-            tsv_to_parquet(tmp.name, output_file, column_names)
+        for field in field_list:
+            convert_one_field(
+                bcf_file, field,
+                out_parquet=f"{output_prefix}_{field}.parquet",
+                columns_file=(f"{columns_prefix}_{field}.txt"
+                              if columns_prefix else None),
+                site_exclude=site_exclude,
+                region=region,
+                workdir=workdir,
+            )
 
-    click.echo(f"Success! Parquet file created: {output_file}")
+    click.echo("Success! " + "  ".join(
+        f"{output_prefix}_{f}.parquet" for f in field_list))
 
 
 @cli.command("list_fields")
 @click.argument("bcf_file", type=click.Path(exists=True))
-@click.option("--annotation-field", default="CSQ", show_default=True)
-def list_fields(bcf_file: str, annotation_field: str):
-    """Print the resolved column list for one VCF, without converting.
+@click.option("--fields", default="CSQ,ANN", show_default=True)
+def list_fields(bcf_file: str, fields: str):
+    """Print the resolved column list per field, without converting.
 
     Worth running on a couple of subshards before a full submission: it is the
-    cheapest way to confirm the header is what you think it is.
+    cheapest way to confirm the header is what you think it is, and the only
+    cheap way to find out whether split-vep can parse this release's ANN
+    header at all.
     """
     check_bcftools()
-    carry = CARRY.get(annotation_field)
-    cols = list(FIXED_COLS) + ([carry] if carry else [])
-    for c in cols + csq_columns(bcf_file, annotation_field):
-        click.echo(c)
+    for field in parse_fields(fields):
+        click.echo(f"# {field}")
+        for c in list(FIXED_COLS) + csq_columns(bcf_file, field):
+            click.echo(c)
+        click.echo("ID")
+        click.echo("")
 
 
 if __name__ == "__main__":

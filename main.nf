@@ -3,8 +3,12 @@
  * AggV3 VEP-annotated msVCF -> long-format annotation parquet, one task per
  * subshard.
  *
- *   CONVERT_ANNOTATIONS  dragen.gel.annotated.vcf.gz -> annotations.parquet
- *   CHECK_SCHEMA         every subshard's column list -> schema.tsv
+ *   CONVERT_ANNOTATIONS  dragen.gel.annotated.vcf.gz -> annotations_<FIELD>.parquet
+ *   CHECK_SCHEMA         every subshard's column list -> schema_<FIELD>.tsv
+ *
+ * One parquet per annotation field, each from its own split-vep pass. A single
+ * pass carrying the other field as a raw string reprinted that whole block on
+ * every consequence row -- ~40 copies per variant on this release.
  *
  * Two processes, not five. Unlike the genotype pipeline there is nothing to
  * join here: each subshard's annotated VCF is self-contained, the extraction
@@ -30,8 +34,9 @@ params.shards          = 'shard-*'  // 'shard-1' to pilot a single shard
 params.subshards       = 'subshard-*'
 params.vcf_name        = 'dragen.gel.annotated.vcf.gz'
 
-// which INFO field to expand; the other one is carried as a raw string column
-params.annotation_field = 'CSQ'
+// INFO fields to expand, one parquet each. Comma-separated. Each gets its own
+// split-vep pass, so neither field's block is reprinted on the other's rows.
+params.annotation_fields = 'CSQ,ANN'
 
 // site filters, applied in bcftools during extraction
 params.max_af          = null
@@ -51,7 +56,7 @@ def helpMessage() {
     Optional:
       --shards            Glob for shards            [${params.shards}]
       --subshards         Glob for subshards         [${params.subshards}]
-      --annotation_field  INFO field to expand       [${params.annotation_field}]
+      --annotation_fields INFO fields to expand      [${params.annotation_fields}]
       --max_af            Drop sites above this AF   [${params.max_af}]
       --max_ac            Drop sites above this AC   [${params.max_ac}]
       --outdir            Publish directory          [${params.outdir}]
@@ -124,8 +129,8 @@ process CONVERT_ANNOTATIONS {
     tuple val(shard), val(subshard), path(vcf), path(idx)
 
     output:
-    tuple val(shard), val(subshard), path("annotations.parquet"), emit: parquet
-    path "columns.txt",     emit: columns
+    tuple val(shard), val(subshard), path("annotations_*.parquet"), emit: parquet
+    path "columns_*.txt",   emit: columns
     path "schema_hash.tsv", emit: hash
     path "convert.log",     emit: log
     path "versions.yml",    emit: versions
@@ -143,17 +148,25 @@ process CONVERT_ANNOTATIONS {
     # diagnosable if this is kept.
     set -o pipefail
     vcf2annotations.py convert_annotations \\
-        ${vcf} annotations.parquet \\
-        --columns-file columns.txt \\
-        --annotation-field ${params.annotation_field} \\
+        ${vcf} annotations \\
+        --columns-prefix columns \\
+        --fields ${params.annotation_fields} \\
         ${af_arg} ${ac_arg} 2>&1 | tee convert.log
 
     # One short line per subshard instead of shipping 3100 column lists to a
     # single task. On awsbatch every staged input is a real download, so the
     # hash keeps CHECK_SCHEMA a genuinely cheap task.
-    printf '%s\\t%s/%s\\t%s\\n' \\
-        "\$(md5sum columns.txt | cut -d' ' -f1)" \\
-        "${shard}" "${subshard}" "\$(wc -l < columns.txt)" > schema_hash.tsv
+    # One line per field per subshard: field, md5, subshard, ncols. The field
+    # is a grouping key in CHECK_SCHEMA -- CSQ and ANN have different column
+    # lists by construction and must not be compared against each other.
+    : > schema_hash.tsv
+    for f in columns_*.txt; do
+        field="\${f#columns_}"; field="\${field%.txt}"
+        printf '%s\\t%s\\t%s/%s\\t%s\\n' \\
+            "\$field" \\
+            "\$(md5sum "\$f" | cut -d' ' -f1)" \\
+            "${shard}" "${subshard}" "\$(wc -l < "\$f")" >> schema_hash.tsv
+    done
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -163,7 +176,12 @@ process CONVERT_ANNOTATIONS {
     """
 
     stub:
-    "touch annotations.parquet columns.txt convert.log versions.yml"
+    """
+    for f in \$(echo ${params.annotation_fields} | tr ',' ' '); do
+        touch annotations_\${f}.parquet columns_\${f}.txt
+    done
+    touch schema_hash.tsv convert.log versions.yml
+    """
 }
 
 process CHECK_SCHEMA {
@@ -172,58 +190,70 @@ process CHECK_SCHEMA {
     publishDir "${params.outdir}/pipeline_info", mode: 'copy', overwrite: true
 
     input:
-    path hashes            // one line per subshard: md5, shard/subshard, ncols
-    path 'reference.txt'   // any one subshard's column list
+    path hashes            // field, md5, shard/subshard, ncols -- one line per field per subshard
+    path 'ref/*'           // one subshard's column list per field
 
     output:
-    path "schema.tsv"
+    path "schema_*.tsv"
     path "schema_check.log"
     path "schema_variants.tsv", optional: true
 
     script:
     """
     #!/usr/bin/env python3
-    import collections, sys
+    import collections, glob, os, sys
 
-    groups = collections.defaultdict(list)
-    ncols = {}
+    # Grouped by field first: CSQ and ANN have different column lists by
+    # construction, and comparing them against each other would report a
+    # mismatch on every run.
+    groups = collections.defaultdict(lambda: collections.defaultdict(list))
+    ncols  = collections.defaultdict(dict)
     for line in open("${hashes}"):
         if not line.strip():
             continue
-        h, name, n = line.rstrip("\\n").split("\\t")
-        groups[h].append(name)
-        ncols[h] = n
+        field, h, name, n = line.rstrip("\\n").split("\\t")
+        groups[field][h].append(name)
+        ncols[field][h] = n
 
-    ref = [c for c in open("reference.txt").read().splitlines() if c]
-    with open("schema.tsv", "w") as out:
-        for i, c in enumerate(ref):
-            out.write(f"{i}\\t{c}\\n")
+    lines, bad = [], False
+    for path in sorted(glob.glob("ref/columns_*.txt")):
+        field = os.path.basename(path)[len("columns_"):-len(".txt")]
+        ref = [c for c in open(path).read().splitlines() if c]
+        with open(f"schema_{field}.tsv", "w") as out:
+            for i, c in enumerate(ref):
+                out.write(f"{i}\\t{c}\\n")
+        g = groups.get(field, {})
+        lines += [
+            f"[{field}] subshards      : {sum(len(v) for v in g.values())}",
+            f"[{field}] schema variants: {len(g)}",
+            f"[{field}] columns        : {len(ref)}",
+        ]
+        if len(g) > 1:
+            bad = True
 
-    lines = [
-        f"subshards      : {sum(len(v) for v in groups.values())}",
-        f"schema variants: {len(groups)}",
-        f"columns        : {len(ref)}",
-    ]
-
-    if len(groups) > 1:
+    if bad:
         # Ordered by size: the majority schema first, then the outliers with a
         # named example each, so the next step is to diff two concrete files.
         with open("schema_variants.tsv", "w") as out:
-            for h, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-                out.write(f"{h}\\t{len(names)}\\t{ncols[h]}\\t{names[0]}\\n")
-        lines.append("")
-        lines.append("Subshards do not share a column schema, so these "
-                     "parquets will not concatenate. See schema_variants.tsv "
-                     "for the group sizes and one example subshard each.")
+            for field, g in sorted(groups.items()):
+                if len(g) < 2:
+                    continue
+                for h, names in sorted(g.items(), key=lambda kv: -len(kv[1])):
+                    out.write(f"{field}\\t{h}\\t{len(names)}\\t"
+                              f"{ncols[field][h]}\\t{names[0]}\\n")
+        lines += ["", "Subshards do not share a column schema within a field, "
+                      "so those parquets will not concatenate. See "
+                      "schema_variants.tsv for the group sizes and one example "
+                      "subshard each."]
 
     open("schema_check.log", "w").write("\\n".join(lines) + "\\n")
     print("\\n".join(lines))
-    if len(groups) > 1:
+    if bad:
         sys.exit(1)
     """
 
     stub:
-    "touch schema.tsv schema_check.log"
+    "touch schema_CSQ.tsv schema_check.log"
 }
 
 // ---------------- helpers ----------------
@@ -271,6 +301,8 @@ workflow {
         storeDir: "${params.outdir}/pipeline_info"
     )
 
+    // .first() emits one task's list of columns_<FIELD>.txt -- all of them,
+    // one per field, staged into ref/ so the check covers every field.
     CHECK_SCHEMA(ch_hashes, CONVERT_ANNOTATIONS.out.columns.first())
 
     CONVERT_ANNOTATIONS.out.versions.first().collectFile(
