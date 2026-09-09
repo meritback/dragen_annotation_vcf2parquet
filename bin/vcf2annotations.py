@@ -61,6 +61,25 @@ CASTS = {
     "AF": pl.Float64,
 }
 
+ANN_COLUMNS = [
+    "allele",
+    "annotation",
+    "annotation_impact",
+    "gene_name",
+    "gene_id",
+    "feature_type",
+    "feature_id",
+    "transcript_biotype",
+    "rank",
+    "hgvs_c",
+    "hgvs_p",
+    "cdna_pos_cdna_length",
+    "cds_pos_cds_length",
+    "aa_pos_aa_length",
+    "distance",
+    "errors_warnings_info",
+]
+
 
 def bcf_to_tsv(bcf_file: str, output_file, format_str: str,
                annotation_field: str = "CSQ",
@@ -198,6 +217,36 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
                 separator=":",
             ).alias("ID")
         )
+        if "ANN" in cols:
+            df = (
+                df
+                .with_columns(
+                    pl.col("ANN")
+                    .str.split(",")
+                    .alias("_ann_record")
+                )
+                .explode("_ann_record")
+
+                # Split each individual ANN record once into its 16 fields.
+                .with_columns(
+                    pl.col("_ann_record")
+                    .str.split("|")
+                    .alias("_ann_parts")
+                )
+
+                # w/o those already available from CSQ.
+                .with_columns(
+                    [
+                        pl.col("_ann_parts")
+                        .list.get(i, null_on_oob=True)
+                        .replace("", None)
+                        .alias(name)
+                        for i, name in ann_only_cols
+                    ]
+                )
+
+                .drop("_ann_record", "_ann_parts")
+            )
 
         df.sink_parquet(output_file, engine="streaming", compression="zstd")
 
