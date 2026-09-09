@@ -6,6 +6,7 @@ import tempfile
 import re
 import os
 import sys
+import time
 from polars.exceptions import NoDataError
 
 # VEP-annotated msVCF -> long-format annotation parquet.
@@ -278,12 +279,18 @@ def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
 
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as workdir:
         with tempfile.NamedTemporaryFile(mode="w+b", dir=workdir) as tmp:
+            t0 = time.perf_counter()
             bcf_to_tsv(bcf_file, tmp, format_str=format_str,
                        annotation_field=annotation_field,
                        view_exclude=site_exclude,
                        region=region)
             tmp.flush()
+            t1 = time.perf_counter()
             tsv_to_parquet(tmp.name, output_file, column_names)
+            t2 = time.perf_counter()
+            print(f"VCF -> TSV:     {t1 - t0:.1f} seconds")
+            print(f"TSV -> Parquet: {t2 - t1:.1f} seconds")
+            print(f"Total:          {t2 - t0:.1f} seconds")
 
     click.echo(f"Success! Parquet file created: {output_file}")
 
