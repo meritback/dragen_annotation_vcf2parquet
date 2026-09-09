@@ -192,6 +192,13 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
     statistics are useful for predicate pushdown without an extra pass.
     """
     cols = set(column_names)
+
+    # Only add ANN fields that don't already exist among the CSQ/fixed columns.
+    ann_only_cols = [
+        (i, name)
+        for i, name in enumerate(ANN_COLUMNS)
+        if name not in cols
+    ]
     try:
         df = pl.scan_csv(
             tsv_file,
