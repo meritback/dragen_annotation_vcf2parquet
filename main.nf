@@ -64,6 +64,46 @@ def helpMessage() {
 }
 
 // ---------------- processes ----------------
+process DIAGNOSE {
+    label 'process_low'
+    publishDir "${params.outdir}/pipeline_info", mode: 'copy'
+
+    output:
+    path 'diag.txt'
+
+    script:
+    '''
+    {
+      set +e
+      echo "== bcftools =="
+      which bcftools
+      bcftools --version 2>&1 | head -3
+
+      echo "== BCFTOOLS_PLUGINS = [${BCFTOOLS_PLUGINS}] =="
+
+      echo "== +split-vep -h exit code =="
+      bcftools +split-vep -h > /dev/null 2>&1
+      echo "rc=$?"
+
+      echo "== +split-vep -h output (first 15 lines) =="
+      bcftools +split-vep -h 2>&1 | head -15
+
+      echo "== plugin -lv =="
+      bcftools plugin -lv 2>&1 | head -20
+
+      echo "== split-vep.so on disk =="
+      find /opt /usr /conda /home /srv -maxdepth 6 -name 'split-vep*' 2>/dev/null
+
+      echo "== python / polars =="
+      which python; python --version
+      python -c "import polars as pl; pl.show_versions()" 2>&1 | head -8
+
+      echo "== env =="
+      env | grep -iE 'conda|bcftools|plugin|path' | sort
+    } 2>&1 | tee diag.txt
+    exit 0
+    '''
+}
 
 process CONVERT_ANNOTATIONS {
     tag "${shard}/${subshard}"
@@ -198,6 +238,10 @@ def indexFor(vcf) {
 // ---------------- workflow ----------------
 
 workflow {
+    DIAGNOSE()
+    return
+
+// workflow {
     if (params.help) { helpMessage(); exit 0 }
     if (!params.annotation_root) { exit 1, "Missing --annotation_root" }
 
