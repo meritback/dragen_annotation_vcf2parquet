@@ -245,9 +245,6 @@ def indexFor(vcf) {
 
 workflow {
     DIAGNOSE()
-    return
-
-// workflow {
     if (params.help) { helpMessage(); exit 0 }
     if (!params.annotation_root) { exit 1, "Missing --annotation_root" }
 

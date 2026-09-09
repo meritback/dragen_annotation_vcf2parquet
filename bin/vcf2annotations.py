@@ -209,14 +209,13 @@ def check_bcftools():
     if subprocess.call(f"type {BCFTOOLS_PATH}", shell=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
         sys.exit(f"Error: Could not find bcftools at '{BCFTOOLS_PATH}'.")
-    # +split-vep is a plugin: bioconda ships it, but BCFTOOLS_PLUGINS has to
-    # point at it in some container layouts. Fail here with a clear message
-    # rather than inside a shell pipeline.
-    rc = subprocess.call(f"{BCFTOOLS_PATH} +split-vep -h", shell=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if rc not in (0, 1):
-        sys.exit("Error: bcftools +split-vep plugin not available. "
-                 "Set BCFTOOLS_PLUGINS to the plugin directory.")
+    p = subprocess.run([BCFTOOLS_PATH, "plugin", "-l"],
+                       capture_output=True, text=True)
+    out = p.stdout + p.stderr
+    if "split-vep" not in out:
+        sys.exit("Error: bcftools +split-vep plugin not available.\n"
+                 f"BCFTOOLS_PLUGINS={os.environ.get('BCFTOOLS_PLUGINS', '<unset>')}\n"
+                 f"{out[:500]}")
 
 
 @click.group()
