@@ -73,34 +73,40 @@ process DIAGNOSE {
 
     script:
     '''
+    set +eu
+
     {
-      set +e
       echo "== bcftools =="
       which bcftools
       bcftools --version 2>&1 | head -3
 
-      echo "== BCFTOOLS_PLUGINS = [${BCFTOOLS_PLUGINS}] =="
+      echo "== BCFTOOLS_PLUGINS = [${BCFTOOLS_PLUGINS:-UNSET}] =="
 
       echo "== +split-vep -h exit code =="
       bcftools +split-vep -h > /dev/null 2>&1
       echo "rc=$?"
 
-      echo "== +split-vep -h output (first 15 lines) =="
+      echo "== +split-vep -h output =="
       bcftools +split-vep -h 2>&1 | head -15
 
       echo "== plugin -lv =="
-      bcftools plugin -lv 2>&1 | head -20
+      bcftools plugin -lv 2>&1 | head -25
 
       echo "== split-vep.so on disk =="
-      find /opt /usr /conda /home /srv -maxdepth 6 -name 'split-vep*' 2>/dev/null
+      find /opt /usr /srv -maxdepth 7 -name 'split-vep*' 2>/dev/null
+
+      echo "== libexec listing =="
+      ls -la /opt/conda/libexec/bcftools 2>&1 | head -20
+
+      echo "== activate.d =="
+      cat /opt/conda/etc/conda/activate.d/*bcftools* 2>&1 | head
 
       echo "== python / polars =="
-      which python; python --version
+      which python; python --version 2>&1
       python -c "import polars as pl; pl.show_versions()" 2>&1 | head -8
+    } > diag.txt 2>&1
 
-      echo "== env =="
-      env | grep -iE 'conda|bcftools|plugin|path' | sort
-    } 2>&1 | tee diag.txt
+    cat diag.txt
     exit 0
     '''
 }
