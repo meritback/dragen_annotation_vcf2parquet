@@ -302,7 +302,7 @@ def process_vep(
     logger.info("Computing MAF from gnomAD populations")
     gnomad_cols = [
         c for c in annos.collect_schema().names()
-        if c.startswith(("gnomade_", "gnomadg_")) and c.endswith("_af")
+        if c.startswith(("gnomadg_af_"))
     ]
     annos = annos.with_columns(
         maf_gnomad=pl.max_horizontal(
