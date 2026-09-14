@@ -127,23 +127,41 @@ def concat_annotations(shards_dir: list[str], out_file: str):
     # there can be multiple shards folderes f (value in list shards_dir), each containing the annotation files like do:
     # {f}/shard-{*}/subshard-{*}/annotations.parquet
     # all_shards should be a list of the paths to   all the parquet files in all the shards folders
-    all_shards = []
+        all_shards = []
+
     for f in shards_dir:
-        all_shards.extend(glob.glob(os.path.join(f, "shard-*/subshard-*/annotations.parquet")))
-    df = pl.scan_parquet(all_shards).collect()
-    df.write_parquet(out_file)
+        all_shards.extend(
+            glob.glob(
+                os.path.join(
+                    f,
+                    "shard-*",
+                    "subshard-*",
+                    "annotations.parquet",
+                )
+            )
+        )
+
+    if not all_shards:
+        raise FileNotFoundError(f"No annotation parquet files found in: {shards_dir}")
+
+    logger.info(f"Found {len(all_shards)} parquet files")
+    logger.info(f"Writing concatenated annotations to {out_file}")
+
+    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+    pl.scan_parquet(all_shards).sink_parquet(out_file, engine="streaming")
+
+    logger.info("Finished concatenating annotations")
 
 # ------------- 2. write variant metadata to a parquet file
 def write_variant_metadata(annotations_file: str, out_file: str):
-    # Load the annotations file
-    annos = pl.read_parquet(annotations_file)
-    annos = annos.rename({col: col.lower() for col in annos.columns})
+    annos = pl.scan_parquet(annotations_file)
 
-    # Create a DataFrame with the variant metadata
-    vm = annos.select(["id", "chrom", "pos", "ref", "alt"]).unique(subset=["id", "chrom", "pos", "ref", "alt"])
+    annos = annos.rename({col: col.lower() for col in annos.collect_schema().names()})
 
-    # Write the variant metadata to a parquet file
-    vm.write_parquet(out_file)
+    vm = (annos.select(["id", "chrom", "pos", "ref", "alt"]).unique())
+
+    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+    vm.sink_parquet(out_file, engine="streaming")
 
 # ------------- 3. process VEP annotations
 def process_vep(
@@ -865,10 +883,17 @@ def main(config_path):
     OUT_PROCESS_VEP = os.path.expanduser(
         output_files["OUT_PROCESS_VEP"]
     )
+    logger.info(f"SHARDS_DIR: {SHARDS_DIR}")
+    logger.info(f"BLOSUM_PATH: {BLOSUM_PATH}")
+    logger.info(f"FASTA_PATH: {FASTA_PATH}")
+    logger.info(f"GTF_PATH: {GTF_PATH}")
+    logger.info(f"OUT_CONCAT_ANNOTATIONS: {OUT_CONCAT_ANNOTATIONS}")
+    logger.info(f"OUT_VAR_METADATA: {OUT_VAR_METADATA}")
+    logger.info(f"OUT_PROCESS_VEP: {OUT_PROCESS_VEP}")
 
 
     concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
-    write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
+    # write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
     process_vep(
         OUT_CONCAT_ANNOTATIONS,
         FASTA_PATH,
