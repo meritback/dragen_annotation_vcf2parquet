@@ -155,10 +155,9 @@ def concat_annotations(shards_dir: list[str], out_file: str):
 # ------------- 2. write variant metadata to a parquet file
 def write_variant_metadata(annotations_file: str, out_file: str):
     annos = pl.scan_parquet(annotations_file)
+    annos = annos.rename({c: c.lower() for c in annos.collect_schema().names()})
 
-    annos = annos.rename({col: col.lower() for col in annos.collect_schema().names()})
-
-    vm = (annos.select(["id", "chrom", "pos", "ref", "alt"]).unique())
+    vm = annos.select(["id", "chrom", "pos", "ref", "alt"]).unique(subset="id")
 
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
     vm.sink_parquet(out_file, engine="streaming")
@@ -166,7 +165,7 @@ def write_variant_metadata(annotations_file: str, out_file: str):
 # ------------- 3. process VEP annotations
 def process_vep(
     annotation_file,
-    # variant_metadata_file,
+    variant_metadata_file,
     fasta_path,
     gtf_path,
     blosum_path,
@@ -263,9 +262,8 @@ def process_vep(
     vep_file = vep_file.unique()
 
     # ── Load variant metadata ──────────────────────────────────────────────
-    # logger.info("Loading variant metadata")
-    # variant_metadata = pl.scan_parquet(variant_metadata_file)
-
+    logger.info("Loading variant metadata")
+    variant_metadata = pl.scan_parquet(variant_metadata_file)
     annos = vep_file
 
     # ── LOFTEE ────────────────────────────────────────────────────────────
@@ -300,6 +298,21 @@ def process_vep(
     #         maf_cohort=pl.col("mac_cohort") / (2 * n_samples)
     #     )
     #     annos = annos.join(maf_df, on="id", how="left", validate="m:1")
+    # -- MAF max of all gnomad populations  --------------------
+    logger.info("Computing MAF from gnomAD populations")
+    gnomad_cols = [
+        c for c in annos.collect_schema().names()
+        if c.startswith(("gnomade_", "gnomadg_")) and c.endswith("_af")
+    ]
+    annos = annos.with_columns(
+        maf_gnomad=pl.max_horizontal(
+            [pl.col(c).cast(pl.Float32, strict=False) for c in gnomad_cols]
+        )
+    )
+
+    tmp = Path(output_path).with_suffix(".stage1.parquet")
+    annos.sink_parquet(tmp, engine="streaming")
+    annos = pl.scan_parquet(tmp).drop(gnomad_cols)
 
     # ── Relative CDS position ─────────────────────────────────────────────
     logger.info("Computing relative CDS positions")
@@ -501,19 +514,19 @@ def process_vep(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     annos.sink_parquet(output_path, engine="streaming")
     logger.info("VEP processing complete")
+    tmp.unlink(missing_ok=True)
 
 
 
 # ── Step 2b: GPN-MSA ──────────────────────────────────────────────────────
 
-def merge_gpn_msa(annotation_file, scores_gpn_msa_file, output_path):
+def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
     """Merge GPN-MSA scores for all chromosomes (one job)."""
     logger.info("Loading annotations for GPN-MSA")
-    annos = pl.scan_parquet(annotation_file)
-    sampled = annos.select(["id", "chrom"]).unique(subset=["id", "chrom"])
+    vm = pl.read_parquet(variant_metadata_path, columns=["id", "chrom"])
 
     scores_lazy = pl.scan_parquet(scores_gpn_msa_file)
-    unique_chroms = sampled["chrom"].unique().to_list()
+    unique_chroms = vm["chrom"].unique().to_list()
     logger.info(f"Processing GPN-MSA for {len(unique_chroms)} chromosomes")
 
     all_scores = []
@@ -535,7 +548,7 @@ def merge_gpn_msa(annotation_file, scores_gpn_msa_file, output_path):
             )
             .select("id", "gpn_score")
         )
-        sampled_chrom = sampled.filter(pl.col("chrom").str.to_lowercase() == chrom.lower()).select("id").lazy()
+        sampled_chrom = vm.filter(pl.col("chrom").str.to_lowercase() == chrom.lower()).select("id").lazy()
         merged = sampled_chrom.join(scores_chr, on="id", how="left").collect()
         all_scores.append(merged)
         logger.info(f"  GPN-MSA done for {chrom}")
@@ -883,6 +896,12 @@ def main(config_path):
     OUT_PROCESS_VEP = os.path.expanduser(
         output_files["OUT_PROCESS_VEP"]
     )
+    GPN_MSA_SCORES  = os.path.expanduser(
+        output_files["GPN_MSA_SCORES"]
+    )
+    OUT_GPN_MSA = os.path.expanduser(
+        output_files["OUT_GPN_MSA"]
+    )
     logger.info(f"SHARDS_DIR: {SHARDS_DIR}")
     logger.info(f"BLOSUM_PATH: {BLOSUM_PATH}")
     logger.info(f"FASTA_PATH: {FASTA_PATH}")
@@ -893,14 +912,28 @@ def main(config_path):
 
 
     concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
-    # write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
+    write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
     process_vep(
         OUT_CONCAT_ANNOTATIONS,
+        OUT_VAR_METADATA,
         FASTA_PATH,
         GTF_PATH,
         BLOSUM_PATH,
-        OUT_PROCESS_VEP,
+        OUT_PROCESS_VEP
     )
+    # YET TO DO
+    # merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
+    # merge_all_pre_cadd(vep_processed_path, gpn_msa_path)
+    # merge_cadd(nocadd_path  = input.nocadd,
+    #         cadd_file    = input.cadd,
+    #         annotation_columns = config["annotation_columns"],
+    #         output_path  = output[0],)
+    # fill_nulls(
+    #     input_path         = input[0],
+    #     annotation_specs = config["annotation_specs"],
+    #     cols_to_keep       = config["annotation_columns"],
+    #     output_path        = output[0],
+    # )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
