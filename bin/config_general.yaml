@@ -1,0 +1,36 @@
+annotation_columns: #cols_to_keep:
+  - id
+  - chrom
+  - pos
+  - ref
+  - alt
+  - region
+  - gene
+  - maf_cohort
+  - maf_gnomad
+  - cadd_phred
+  - cadd_raw
+  - next_in_frame_relative
+  - gpn_score
+  - spliceai_delta_score
+  - am_pathogenicity
+  - is_plof
+  - loftee_hc
+  - loftee_lc
+  - relative_cds_position
+  - blosum62
+
+annotation_specs:
+  maf_cohort: [0]
+  maf_gnomad: [0]
+  cadd_phred: [0]
+  cadd_raw: [0.28051]
+  next_in_frame_relative: [0]
+  gpn_score: [-1.41]
+  spliceai_delta_score: [0]
+  am_pathogenicity: [0]
+  is_plof: [0]
+  loftee_hc: [0]
+  loftee_lc: [0]
+  relative_cds_position: [0]
+  blosum62: [0]
