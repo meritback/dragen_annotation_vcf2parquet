@@ -127,7 +127,7 @@ def concat_annotations(shards_dir: list[str], out_file: str):
     # there can be multiple shards folderes f (value in list shards_dir), each containing the annotation files like do:
     # {f}/shard-{*}/subshard-{*}/annotations.parquet
     # all_shards should be a list of the paths to   all the parquet files in all the shards folders
-        all_shards = []
+    all_shards = []
 
     for f in shards_dir:
         all_shards.extend(
@@ -291,7 +291,7 @@ def process_vep(
 
     # ── MAF ───────────────────────────────────────────────────────────────
     logger.info("renaming MAF")
-    annos = annos.with_columns("AF").alias("maf_cohort")
+    annos = annos.rename({"af": "maf_cohort"})
     # vm_schema = variant_metadata.collect_schema().names()
     # if "mac_cohort" in vm_schema and n_samples is not None:
     #     logger.info(f"{n_samples} samples, computing MAF from MAC")
