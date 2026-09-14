@@ -14,6 +14,15 @@ from tqdm import tqdm
 import argparse
 import glob
 
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    filename="log.txt",
+    filemode="w",
+)
+
 
 # https://github.com/HolEv/deeprvat_wgs/blob/main/scripts/annotation/annotation_functions.py
 
