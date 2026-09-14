@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import yaml
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,9 @@ import polars as pl
 import pyranges as pr
 from pathlib import Path
 from tqdm import tqdm
+import argparse
+import glob
+
 
 # https://github.com/HolEv/deeprvat_wgs/blob/main/scripts/annotation/annotation_functions.py
 
@@ -109,7 +113,7 @@ def convert_to_int_and_get_max(value):
         return max(ints) if ints else None
 
 # ------------- 1. concatenate all shards of annotations into a single DataFrame and write to a parquet file
-def concat_annotations(shards_dir: List[str], out_file: str):
+def concat_annotations(shards_dir: list[str], out_file: str):
     """Concatenate shards of annotations into a single DataFrame and write to a parquet file."""
     # there can be multiple shards folderes f (value in list shards_dir), each containing the annotation files like do:
     # {f}/shard-{*}/subshard-{*}/annotations.parquet
@@ -822,18 +826,36 @@ def fill_nulls(input_path, annotation_specs, cols_to_keep, output_path):
 
 
 # main function to run all steps
-def main():
+def main(config_path):
     # Paths
-    SHARDS_DIR = ("shards1-10", "shards11-98")#something like this
+    # Load config
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
 
-    BLOSUM_PATH = "path/to/References/BLOSUM/blosum62.txt"
-    FASTA_PATH = "path/to/References/GENCODE/GRCh38.primary_assembly.genome.fa"
-    GTF_PATH = "path/to/References/GENCODE/gencode.v49.annotation.gtf"
+    # Input paths
+    input_files = config["input_files"]
 
-    OUT_CONCAT_ANNOTATIONS = "Data_out/annotations/annotations_processed/annotations.parquet"
-    OUT_VAR_METADATA = "Data_out/annotations/annotations_processed/variant_metadata.parquet"
-    OUT_PROCESS_VEP = "Data_out/annotations/annotations_processed/annotations_vep_processed.parquet"
+    SHARDS_DIR = [
+        os.path.expanduser(path)
+        for path in input_files["SHARDS_DIR"]
+    ]
 
+    BLOSUM_PATH = input_files["blosum_path"]
+    FASTA_PATH = input_files["FASTA_PATH"]
+    GTF_PATH = input_files["GTF_PATH"]
+
+    # Output paths
+    output_files = config["output_files"]
+
+    OUT_CONCAT_ANNOTATIONS = os.path.expanduser(
+        output_files["OUT_CONCAT_ANNOTATIONS"]
+    )
+    OUT_VAR_METADATA = os.path.expanduser(
+        output_files["OUT_VAR_METADATA"]
+    )
+    OUT_PROCESS_VEP = os.path.expanduser(
+        output_files["OUT_PROCESS_VEP"]
+    )
 
 
     concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
@@ -845,3 +867,14 @@ def main():
         BLOSUM_PATH,
         OUT_PROCESS_VEP,
     )
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to config YAML file",
+    )
+    args = parser.parse_args()
+
+    main(args.config)
