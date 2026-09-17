@@ -193,7 +193,7 @@ def concat_annotations(shards_dir: list[str], out_file: str):
             ).abs() < 50
         )
         .with_columns(
-            pl.col(c).replace(["-", ""], None).cast(t) for c, t in casts.items()
+            [pl.col(c).cast(t, strict=False) for c, t in CASTS.items()]
         )
         .sink_parquet(out_file, engine="streaming")
     )
