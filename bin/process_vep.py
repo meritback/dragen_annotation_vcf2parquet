@@ -23,6 +23,44 @@ logging.basicConfig(
     filemode="w",
 )
 
+SPLICE = ["ag", "al", "dg", "dl"]
+CASTS = {
+    "POS": pl.Int32, "QUAL": pl.Float32, "AC": pl.Int32, "AN": pl.Int32, "AF": pl.Float32,
+    "distance": pl.Int32,
+    "strand": pl.Int8,
+    "tsl": pl.Int8,
+    "existing_inframe_oorfs": pl.Int16,
+    "existing_outofframe_oorfs": pl.Int16,
+    "existing_uorfs": pl.Int16,
+    **{c: pl.Float32 for c in ["af_2", "afr_af", "amr_af", "eas_af", "eur_af", "sas_af",
+                               "max_af", "cadd_phred", "cadd_raw", "revel"]},
+    **{f"spliceai_pred_ds_{s}": pl.Float32 for s in SPLICE},
+    **{f"spliceai_pred_dp_{s}": pl.Int16 for s in SPLICE},
+    **{c: pl.Float32 for c in annos.columns if c.startswith("gnomadg")},
+    }
+
+ANN_COLUMNS = [
+    "ANN",
+    "annotation",
+    "annotation_impact",
+    "gene_name",
+    "gene_id",
+    "feature_type",
+    "feature_id",
+    "transcript_biotype",
+    "rank",
+    "hgvs_c",
+    "hgvs_p",
+    "cdna_pos_cdna_length",
+    "cds_pos_cds_length",
+    "aa_pos_aa_length",
+    "errors_warnings_info",
+]
+VEP_TO_DROP = ["mechpredict_pdn",
+    "mechpredict_pgof",
+    "mechpredict_plof",
+    "mechpredict_prediction"]
+
 
 # https://github.com/HolEv/deeprvat_wgs/blob/main/scripts/annotation/annotation_functions.py
 
@@ -146,9 +184,24 @@ def concat_annotations(shards_dir: list[str], out_file: str):
 
     logger.info(f"Found {len(all_shards)} parquet files")
     logger.info(f"Writing concatenated annotations to {out_file}")
+    #Ints and floats to 32, binary booleans
 
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
-    pl.scan_parquet(all_shards).sink_parquet(out_file, engine="streaming")
+    # drop 
+    (pl.scan_parquet(all_shards)
+        .drop(ANN_COLUMNS).drop(VEP_TO_DROP) # alternatively: select?
+        .unique(subset=["ID", "feature"])
+        .filter(
+            (
+                pl.col("ALT").str.len_chars().cast(pl.Int64)
+                - pl.col("REF").str.len_chars().cast(pl.Int64)# int 32 makes negative falues large
+            ).abs() > 50
+        )
+        .with_columns(
+            [pl.col(c).cast(t, strict=False) for c, t in CASTS.items()]
+        )
+        .sink_parquet(out_file, engine="streaming")
+    )
 
     logger.info("Finished concatenating annotations")
 
@@ -222,44 +275,74 @@ def process_vep(
             assert vep_file.select(pl.col(col).is_null().sum()).collect().item() == 0
 
     # ── Consequence dummies ────────────────────────────────────────────────
-    logger.info("Creating consequence dummy variables")
+    # logger.info("Creating consequence dummy variables")
 
+    # dummies = (
+    #     vep_file
+    #     .select("consequence")
+    #     .unique()  # reduce Memory usage for the explode step
+    #     .with_columns(
+    #         pl.col("consequence")
+    #         .str.split(",")
+    #         .alias("_consequence")
+    #     )
+    #     .explode("_consequence")
+    #     .filter(
+    #         pl.col("_consequence").is_not_null()
+    #         & (pl.col("_consequence") != "")
+    #     )
+    #     .collect()
+    #     .to_dummies(columns="_consequence")
+    #     .group_by("consequence")
+    #     .max()
+    # )
+
+    # # restore your original naming convention:
+    # # consequence_missense_variant, etc.
+    # dummies = dummies.rename({
+    #     c: c.replace("_consequence_", "consequence_")
+    #     for c in dummies.columns
+    #     if c.startswith("_consequence_")
+    # })
+
+    # logger.info(f"Created {len(dummies.columns) - 1} consequence dummy columns")
+
+    # vep_file = vep_file.join(
+    #     dummies.lazy(),
+    #     on="consequence",
+    #     how="left",
+    # )
+
+    # vep_file = vep_file.rename(
+    #     {col: col.lower() for col in vep_file.collect_schema().names()}
+    # )
+
+    # dtype_update = {
+    #     col: pl.Int8
+    #     for col in vep_file.collect_schema().names()
+    #     if col.startswith("consequence_")
+    # }
+    # dtype_update["strand"] = pl.Utf8
+
+    # vep_file = vep_file.with_columns(
+    #     [pl.col(col).cast(dtype) for col, dtype in dtype_update.items()]
+    # )
+    
+    # ── Consequence dummies ────────────────────────────────────────────────
+    logger.info("Creating consequence dummy variables")
+    vep_file = vep_file.with_row_index("row_nr")
     dummies = (
-        vep_file
-        .select("consequence")
-        .unique()  # reduce Memory usage for the explode step
-        .with_columns(
-            pl.col("consequence")
-            .str.split(",")
-            .alias("_consequence")
-        )
-        .explode("_consequence")
-        .filter(
-            pl.col("_consequence").is_not_null()
-            & (pl.col("_consequence") != "")
-        )
+        vep_file.select(["row_nr", "consequence"])
+        .with_columns(pl.col("consequence").str.split(","))
+        .explode("consequence")
+        .filter(pl.col("consequence").is_not_null() & (pl.col("consequence") != ""))
         .collect()
-        .to_dummies(columns="_consequence")
-        .group_by("consequence")
+        .to_dummies(columns="consequence")
+        .group_by("row_nr")
         .max()
     )
-
-    # restore your original naming convention:
-    # consequence_missense_variant, etc.
-    dummies = dummies.rename({
-        c: c.replace("_consequence_", "consequence_")
-        for c in dummies.columns
-        if c.startswith("_consequence_")
-    })
-
     logger.info(f"Created {len(dummies.columns) - 1} consequence dummy columns")
-
-    vep_file = vep_file.join(
-        dummies.lazy(),
-        on="consequence",
-        how="left",
-    )
-
+    vep_file = vep_file.join(dummies.lazy(), on="row_nr", how="left").drop("row_nr")
     vep_file = vep_file.rename(
         {col: col.lower() for col in vep_file.collect_schema().names()}
     )
@@ -267,10 +350,9 @@ def process_vep(
     dtype_update = {
         col: pl.Int8
         for col in vep_file.collect_schema().names()
-        if col.startswith("consequence_")
+        if "consequence_" in col
     }
     dtype_update["strand"] = pl.Utf8
-
     vep_file = vep_file.with_columns(
         [pl.col(col).cast(dtype) for col, dtype in dtype_update.items()]
     )
