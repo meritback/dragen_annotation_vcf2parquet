@@ -1029,7 +1029,7 @@ def merge_all_pre_cadd(
     # promoter_ai_file,
     # pai3_file,
     # encode_path,
-    # output_path,
+    output_path,
 ):
     """
     Merge all external scores (except CADD) into the main annotation table:
@@ -1396,13 +1396,14 @@ def main(config_path, config_general_path):
     # YET TO DO
     merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
     merge_all_pre_cadd(OUT_PROCESS_VEP, OUT_GPN_MSA, OUT_PRE_CADD)
-    merge_cadd(nocadd_path  = OUT_PRE_CADD,
-            cadd_file    = CADD_PATH,
-            annotation_columns = config_general["annotation_columns"],
-            output_path  = OUT_CADD)
+    # this large CADD file is not available in the repo, so this step is commented out for now
+    # merge_cadd(nocadd_path  = OUT_PRE_CADD,
+    #         cadd_file    = CADD_PATH,
+    #         annotation_columns = config_general["annotation_columns"],
+    #         output_path  = OUT_CADD)
             
     fill_nulls(
-        input_path         = OUT_CADD,
+        input_path         = OUT_PRE_CADD, #OUT_CADD,
         annotation_specs = config_general["annotation_specs"],
         cols_to_keep       = config_general["annotation_columns"],
         output_path        = OUT_CADD_NA,
