@@ -386,12 +386,12 @@ def process_vep(
             .alias("relative_cds_position")
         )
     )
-    cds_merged = annos.select("id", "gene").join(
-        sites.select("id", "gene", "relative_cds_position"),
-        on=["id", "gene"],
+    cds_merged = annos.select("id", "gene", "feature").join(
+        sites.select("id", "gene", "feature", "relative_cds_position"),
+        on=["id", "gene", "feature"],
         how="left",
     )
-    annos = annos.join(cds_merged, on=["id", "gene"], how="left", validate="1:1")
+    annos = annos.join(cds_merged, on=["id", "gene", "feature"], how="left", validate="1:1")
 
     # ── Start-lost: next in-frame ATG ─────────────────────────────────────
     logger.info("Processing start_lost variants for next in-frame ATG")
@@ -448,7 +448,7 @@ def process_vep(
             start_lost_df[["gene", "id", "next_in_frame_relative"]]
         )
         annos = annos.join(
-            start_lost_pl.lazy(), on=["id", "gene"], how="left", validate="1:1"
+            start_lost_pl.lazy(), on=["id", "gene", "feature"], how="left", validate="1:1"
         )
 
     # ── SpliceAI max delta score ───────────────────────────────────────────
@@ -490,7 +490,7 @@ def process_vep(
     # logger.info("Processing 5' UTR variant consequence annotations")
     # if "five_prime_utr_variant_consequence" in annos.collect_schema().names():
     #     utr_df = annos.select(
-    #         "id", "gene", "five_prime_utr_variant_consequence"
+    #         ""id", "gene", "feature" "five_prime_utr_variant_consequence"
     #     ).with_row_index("row_nr")
     #     dummies = (
     #         utr_df.select(["row_nr", "five_prime_utr_variant_consequence"])
@@ -506,11 +506,11 @@ def process_vep(
     #         .max()
     #     )
     #     utr_df = (
-    #         utr_df.select("id", "gene", "row_nr")
+    #         utr_df.select("id", "gene", "feature", "row_nr")
     #         .join(dummies.lazy(), on="row_nr", how="left")
     #         .drop("row_nr")
     #     )
-    #     annos = annos.join(utr_df, on=["id", "gene"], how="left", validate="1:1")
+    #     annos = annos.join(utr_df, on=["id", "gene", "feature"], how="left", validate="1:1")
 
     # ── Variant length / indel flags ──────────────────────────────────────
     logger.info("Computing variant lengths and indel flags")
@@ -689,18 +689,18 @@ def merge_all_pre_cadd(
     #     )
     #     .rename({"gene": "gene_name", "gene_id": "gene", "promoterAI": "promoterai"})
     #     .with_columns(pl.col("promoterai").abs().alias("promoterai_abs"))
-    #     .select("promoterai", "promoterai_abs", "id", "gene")
+    #     .select("promoterai", "promoterai_abs", "id", "gene", "feature")
     # )
     # scores = annos.select("gene", "id").join(
-    #     promoter_ai, how="left", on=["id", "gene"], validate="1:m"
+    #     promoter_ai, how="left", on=["id", "gene", "feature"], validate="1:m"
     # )
     # scores_grouped = scores.group_by(["gene", "id"]).agg(
     #     pl.col("promoterai").sort_by(pl.col("promoterai_abs"), descending=True).first()
     # )
     # annos = annos.join(
-    #     scores_grouped.select("promoterai", "id", "gene"),
+    #     scores_grouped.select("promoterai", "id", "gene", "feature"),
     #     how="left",
-    #     on=["id", "gene"],
+    #     on=["id", "gene", "feature"],
     #     validate="1:1",
     # )
 
