@@ -100,8 +100,292 @@ def _load_blosum62_sij(path: str) -> pl.DataFrame:
 
 
 # ── Low-level helpers ──────────────────────────────────────────────────────
+# SHUBHANKAR
+ 
+def _load_gtf_polars(gtf_path: str) -> pl.DataFrame:
+    """Read a (possibly gzipped) Gencode GTF into a polars DataFrame."""
+    return pl.read_csv(
+        gtf_path,
+        separator="\t",
+        comment_prefix="#",
+        has_header=False,
+        new_columns=[
+            "chrom", "source", "feature", "start", "end",
+            "score", "strand", "frame", "attributes",
+        ],
+        schema_overrides={
+            "chrom": pl.Utf8, "start": pl.Int64, "end": pl.Int64,
+            "feature": pl.Utf8, "strand": pl.Utf8, "attributes": pl.Utf8,
+        },
+        ignore_errors=True,
+    )
+ 
+ 
+def _gtf_gene_features(gtf: pl.DataFrame) -> pl.DataFrame:
+    """Per-gene TSS, length and name from GTF 'gene' rows (protein-coding only).
+ 
+    Returns columns: region, gene_name, gene_length, _tss, _gene_strand.
+    """
+    return (
+        gtf.filter(pl.col("feature") == "gene")
+        .with_columns(
+            region=pl.col("attributes").str.extract(r'gene_id "([^"]+)"')
+                  .str.split(".").list.first(),
+            gene_name=pl.col("attributes").str.extract(r'gene_name "([^"]+)"'),
+            gene_type=pl.col("attributes")
+                  .str.extract(r'gene_(?:type|biotype) "([^"]+)"'),
+        )
+        .filter(pl.col("gene_type") == "protein_coding")
+        .with_columns(
+            gene_length=pl.col("end") - pl.col("start") + 1,
+            _tss=pl.when(pl.col("strand") == "+")
+                  .then(pl.col("start"))
+                  .otherwise(pl.col("end")),
+            _gene_strand=pl.col("strand"),
+        )
+        .select(["region", "gene_name", "gene_length", "_tss", "_gene_strand"])
+        .unique(subset=["region"])
+    )
+ 
+ 
+def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
+    """Per-gene TSS of the MANE Select transcript (GTF 'transcript' rows).
+ 
+    For genes with no MANE Select transcript, falls back to the transcript
+    tagged Ensembl_canonical. Used for dist_to_tss_v39 against a GENCODE v39
+    GTF so the promoter region matches PromoterAI's benchmark definition.
+ 
+    Returns one row per gene: region, _tss_v39, _gene_strand_v39.
+    """
+    tx = (
+        gtf.filter(pl.col("feature") == "transcript")
+        .with_columns(
+            region=pl.col("attributes").str.extract(r'gene_id "([^"]+)"')
+                  .str.split(".").list.first(),
+            gene_type=pl.col("attributes")
+                  .str.extract(r'gene_(?:type|biotype) "([^"]+)"'),
+            _is_mane=pl.col("attributes").str.contains(r'tag "MANE_Select"'),
+            _is_canonical=pl.col("attributes")
+                  .str.contains(r'tag "Ensembl_canonical"'),
+            _tss_v39=pl.when(pl.col("strand") == "+")
+                  .then(pl.col("start"))
+                  .otherwise(pl.col("end")),
+            _gene_strand_v39=pl.col("strand"),
+        )
+        # Same protein-coding restriction as _gtf_gene_features: Ensembl_canonical
+        # (the fallback) also tags lncRNAs / pseudogenes, which are not in scope.
+        .filter(
+            (pl.col("gene_type") == "protein_coding")
+            & (pl.col("_is_mane") | pl.col("_is_canonical"))
+        )
+        # MANE Select wins over Ensembl_canonical; one transcript per gene.
+        .sort(["region", "_is_mane"], descending=[False, True])
+        .unique(subset=["region"], keep="first", maintain_order=True)
+    )
+    n_mane = int(tx.select(pl.col("_is_mane").sum()).item())
+    logger.info(
+        f"  v39 MANE/canonical TSS: {tx.height} genes "
+        f"({n_mane} MANE Select, {tx.height - n_mane} Ensembl_canonical fallback)"
+    )
+    return tx.select(["region", "_tss_v39", "_gene_strand_v39"])
+ 
+ 
+def _idempotent_join(
+    left: pl.LazyFrame,
+    right: pl.LazyFrame,
+    on: list[str],
+    how: str = "left",
+    **kwargs,
+) -> pl.LazyFrame:
+    """Left-join that is safe to re-run in a notebook.
+ 
+    Drops any columns the right frame would add that already exist in the left
+    frame (excluding the join keys), so repeated cell executions don't produce
+    DuplicateError.
+    """
+    left_cols = set(left.collect_schema().names())
+    right_cols = set(right.collect_schema().names())
+    keys = set(on) if isinstance(on, list) else {on}
+    to_drop = (right_cols - keys) & left_cols
+    if to_drop:
+        left = left.drop(list(to_drop))
+    return left.join(right, on=on, how=how, **kwargs)
+ 
+ 
+def _next_inframe_atg_distance(seq: str, search_init: int = 3) -> int:
+    """Return nt distance from position `search_init` to the next in-frame ATG.
+ 
+    Searches codons starting at `search_init` (0-based, must be frame-0
+    relative to the CDS start). Returns the codon offset (in nt) of the first
+    ATG found, or -1 if none exists in `seq`.
+    """
+    for i in range(search_init, len(seq) - 2, 3):
+        if seq[i:i + 3].upper() == "ATG":
+            return i
+    return -1
+ 
+ 
+def _compute_next_in_frame(
+    annos: pl.LazyFrame,
+    tx_cds_len: pl.DataFrame,
+    fasta_path: str,
+) -> pl.LazyFrame:
+    """Add next_in_frame_relative for start_lost SNVs (polars-native + pyfaidx).
+ 
+    Port of add_more_annotations.py::_compute_next_in_frame. Identical sequence
+    logic (genomic window from the CDS start, cds_length + 100 nt, reverse-
+    complemented on the minus strand; next in-frame ATG / cds_length, capped
+    at 1; 1.0 when no ATG, no CDS length or a FASTA error). Differences, all
+    because the VEP output has one row per transcript:
+      * cds_length is the transcript's CDS length (not a gene-level sum)
+      * results are keyed and joined on (id, gene, feature), not (id, region)
+      * cds_start is parsed from cds_position (see _cds_start_expr)
+    """
+    try:
+        import pyfaidx  # noqa: PLC0415
+    except ImportError:
+        logger.warning(
+            "  pyfaidx not installed; skipping next_in_frame_relative. "
+            "Add pyfaidx to your conda environment."
+        )
+        return annos
+ 
+    schema = set(annos.collect_schema().names())
+    req = {"id", "gene", "feature", "chrom", "pos", "ref", "alt",
+           "cds_position", "strand", "consequence_start_lost"}
+    missing = req - schema
+    if missing:
+        logger.warning(f"  next_in_frame: missing columns {missing}; skipping")
+        return annos
+ 
+    # ── Subset to start_lost SNVs with usable cds_start ──────────────────
+    start_lost = (
+        annos
+        .filter(pl.col("consequence_start_lost") == 1)
+        .filter(
+            (pl.col("ref").str.len_chars() == 1) &
+            (pl.col("alt").str.len_chars() == 1)
+        )
+        .with_columns(cds_start=_cds_start_expr())
+        .filter(pl.col("cds_start").is_not_null())
+        .filter(pl.col("strand").is_not_null())
+        .select(["id", "gene", "feature", "chrom", "pos", "cds_start", "strand"])
+        .collect()
+    )
+ 
+    if start_lost.is_empty():
+        logger.info("  next_in_frame: no start_lost SNVs found; skipping")
+        return annos
+ 
+    # ── Per-transcript CDS lengths (from the GTF) ─────────────────────────
+    start_lost = (
+        start_lost.with_columns(_tx=_tx_key())
+        .join(tx_cds_len, on="_tx", how="left")
+        .drop("_tx")
+    )
+ 
+    # ── Fetch sequences and find next ATG ────────────────────────────────
+    fasta = pyfaidx.Fasta(fasta_path, sequence_always_upper=True)
+    records = []
+    for row in start_lost.iter_rows(named=True):
+        keys      = {"id": row["id"], "gene": row["gene"], "feature": row["feature"]}
+        chrom     = str(row["chrom"])
+        pos       = row["pos"]           # 1-based genomic position
+        cds_pos   = row["cds_start"]     # 1-based position of variant IN CDS
+        strand    = str(row["strand"])   # "1" or "-1"
+        cds_len   = row.get("cds_length") or 0
+ 
+        if cds_len == 0:
+            records.append({**keys, "next_in_frame_relative": 1.0})
+            continue
+ 
+        try:
+            chrom_key = chrom if chrom in fasta else chrom.lstrip("chr")
+            if strand == "1":
+                # Genomic start of CDS = variant_genomic_pos - (cds_pos - 1)
+                cds_genome_start = pos - (cds_pos - 1)   # 1-based
+                # Fetch CDS + 100 nt buffer for downstream search
+                seq = str(fasta[chrom_key][cds_genome_start - 1 : cds_genome_start - 1 + cds_len + 100])
+            else:
+                # On minus strand VEP cds_pos counts from the transcript 5' end.
+                # Genomic end of CDS (highest coordinate) = pos + (cds_pos - 1)
+                cds_genome_end = pos + (cds_pos - 1)     # 1-based inclusive
+                raw = str(fasta[chrom_key][cds_genome_end - cds_len - 100 : cds_genome_end])
+                seq = raw[::-1].translate(str.maketrans("ACGTacgt", "TGCAtgca"))
+ 
+            dist = _next_inframe_atg_distance(seq, search_init=3)
+            rel  = 1.0 if dist < 0 else min(dist / cds_len, 1.0)
+        except Exception as fe:
+            logger.debug(f"  next_in_frame: FASTA error for {row['id']}: {fe}")
+            rel = 1.0
+ 
+        records.append({**keys, "next_in_frame_relative": rel})
+ 
+    if not records:
+        return annos
+ 
+    nif = pl.DataFrame(records, schema={
+        "id": pl.Utf8, "gene": pl.Utf8, "feature": pl.Utf8,
+        "next_in_frame_relative": pl.Float32,
+    })
+    annos = _idempotent_join(
+        annos, nif.lazy(), on=["id", "gene", "feature"], validate="1:1"
+    )
+    logger.info(f"  next_in_frame_relative OK ({len(records)} start_lost variant-transcripts)")
+    return annos
 
+# new 
+def _tx_key(col: str = "feature") -> pl.Expr:
+    """Transcript ID without version (ENST00000123456.7 -> ENST00000123456).
+ 
+    Same version stripping add_more_annotations.py applies to gene_id.
+    """
+    return pl.col(col).str.split(".").list.first()
+ 
+ 
+def _cds_start_expr() -> pl.Expr:
+    """cds_start from VEP's cds_position string ("123", "123-125", "?-125").
+ 
+    add_more_annotations.py reads VEP's integer `cds_start` field. Here VEP ran
+    without --total_length, so cds_position holds just the position(s); the
+    leading integer is cds_start ("?-125" -> null, like a missing cds_start).
+    """
+    return pl.col("cds_position").str.extract(r"^(\d+)").cast(pl.Int64)
+ 
+ 
+def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
+    """Sum CDS exon lengths per transcript.
+ 
+    Same as add_more_annotations.py's gene_cds_len (CDS rows, end - start + 1,
+    summed), but grouped by transcript_id instead of gene_id: VEP output has
+    one row per transcript, and a gene-level sum counts exons shared between
+    isoforms once per isoform.
+ 
+    Returns: _tx (ENST without version), cds_length.
+    """
+    per_chrom = (
+        gtf.filter(pl.col("feature") == "CDS")
+        .with_columns(
+            transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
+            seg_len=pl.col("end") - pl.col("start") + 1,
+        )
+        .filter(
+            pl.col("transcript_id").is_not_null()
+            & ~pl.col("transcript_id").str.ends_with("_PAR_Y")
+        )
+        .with_columns(_tx=_tx_key("transcript_id"))
+        .group_by(["_tx", "chrom"])
+        .agg(cds_length=pl.col("seg_len").sum())
+    )
+    # Guard for PAR genes annotated on both chrX and chrY under one ID:
+    # keep one copy (non-chrY) instead of summing both.
+    return (
+        per_chrom.sort(["_tx", pl.col("chrom") == "chrY"])
+        .unique(subset=["_tx"], keep="first", maintain_order=True)
+        .select(["_tx", "cds_length"])
+    )
 
+# EVA
 def get_regions_positive_strand(variant_df, fasta_path):
     seqs_df = variant_df.query("strand == '1'").copy()
     if seqs_df.empty:
@@ -274,7 +558,7 @@ def process_vep(
     vep_file = vep_file.with_row_index("row_nr")
     dummies = (
         vep_file.select(["row_nr", "consequence"])
-        .with_columns(pl.col("consequence").str.split(","))
+        .with_columns(pl.col("consequence").str.split("&"))
         .explode("consequence")
         .filter(pl.col("consequence").is_not_null() & (pl.col("consequence") != ""))
         .collect()
@@ -365,103 +649,164 @@ def process_vep(
     annos.sink_parquet(tmp, engine="streaming")
     annos = pl.scan_parquet(tmp).drop(gnomad_cols)
 
+    # -------- was not run with --total_length, so cds_position is just the start (or range) of the variant in the CDS
+    # GENCODE GTF v49 (match vep115)
+    logger.info(f"Loading GTF {gtf_path}")
+    gtf = _load_gtf_polars(gtf_path)
+    gene_features = _gtf_gene_features(gtf)
+
+    cds_segments = _gtf_transcript_cds(gtf)
+    cds_length_df = _gtf_transcript_cds_length(cds_segments)
+    del gtf
+    gc.collect()
+    logger.info(
+        f"  GTF: {gene_features.height} protein-coding genes, "
+        f"{cds_length_df.height} transcripts with CDS"
+    )
+    # As in add_more_annotations.py, but the CDS length is per transcript
+    # (joined on `feature`), because there is one row per transcript.
+    logger.info("Computing relative CDS positions (cds_start / GTF CDS length)")
+    annos = (
+        _idempotent_join(
+            annos.with_columns(_tx=_tx_key()), tx_cds_len.lazy(),
+            on=["_tx"], validate="m:1",
+        )
+        .with_columns(
+            relative_cds_position=(
+                _cds_start_expr().cast(pl.Float64)
+                / pl.col("cds_length").cast(pl.Float64)
+            ).clip(0.0, 1.0).round(4).cast(pl.Float32)
+        )
+        .drop("_tx")
+        # keep cds_length — also used by next_in_frame
+    )
+    match_rate = (
+        annos.filter(pl.col("cds_position").is_not_null())
+        .select(pl.col("cds_length").is_not_null().mean())
+        .collect()
+        .item()
+    )
+    logger.info(f"  CDS length found for {match_rate:.1%} of rows with cds_position")
+
+    # ── next_in_frame_relative (start_lost SNVs only) ────────────────────
+    logger.info("Processing start_lost variants for next in-frame ATG")
+    annos = _compute_next_in_frame(annos, tx_cds_len, fasta_path)
+
+
     # ── Relative CDS position ─────────────────────────────────────────────
-    logger.info("Computing relative CDS positions")
-    sites = (
-        annos.with_columns(cds_parts=pl.col("cds_position").str.split("/"))
-        .with_columns(
-            length=pl.col("cds_parts").list.get(1),
-            protein_pos=pl.col("cds_parts").list.get(0),
-        )
-        .with_columns(
-            pl.col("protein_pos")
-            .map_elements(convert_to_int_and_get_max, return_dtype=pl.Int64)
-            .alias("protein_pos")
-        )
-        .filter(pl.col("protein_pos").is_not_null())
-        .with_columns(pl.col("length").cast(pl.Int64))
-        .with_columns(
-            (pl.col("protein_pos") / pl.col("length"))
-            .round(2)
-            .alias("relative_cds_position")
-        )
-    )
-    cds_merged = annos.select("id", "gene", "feature").join(
-        sites.select("id", "gene", "feature", "relative_cds_position"),
-        on=["id", "gene", "feature"],
-        how="left",
-    )
-    annos = annos.join(cds_merged, on=["id", "gene", "feature"], how="left", validate="1:1")
+    # does not work this way, as not run with --total_length
+    # logger.info("Computing relative CDS positions")
+    # sites = (
+    #     annos.with_columns(cds_parts=pl.col("cds_position").str.split("/"))
+    #     .with_columns(
+    #         length=pl.col("cds_parts").list.get(1),
+    #         protein_pos=pl.col("cds_parts").list.get(0),
+    #     )
+    #     .with_columns(
+    #         pl.col("protein_pos")
+    #         .map_elements(convert_to_int_and_get_max, return_dtype=pl.Int64)
+    #         .alias("protein_pos")
+    #     )
+    #     .filter(pl.col("protein_pos").is_not_null())
+    #     .with_columns(pl.col("length").cast(pl.Int64))
+    #     .with_columns(
+    #         (pl.col("protein_pos") / pl.col("length"))
+    #         .round(2)
+    #         .alias("relative_cds_position")
+    #     )
+    # )
+    # cds_merged = annos.select("id", "gene", "feature").join(
+    #     sites.select("id", "gene", "feature", "relative_cds_position"),
+    #     on=["id", "gene", "feature"],
+    #     how="left",
+    # )
+    # annos = annos.join(cds_merged, on=["id", "gene", "feature"], how="left", validate="1:1")
 
     # ── Start-lost: next in-frame ATG ─────────────────────────────────────
-    logger.info("Processing start_lost variants for next in-frame ATG")
-    schema_names = annos.collect_schema().names()
-    if "consequence_start_lost" in schema_names:
-        vep_start_lost = (
-            annos.filter(pl.col("consequence_start_lost") == 1)
-            .select(
-                [
-                    "pos",
-                    "chrom",
-                    "gene",
-                    "id",
-                    "cds_position",
-                    "codons",
-                    "strand",
-                    "allele",
-                ]
-            )
-            .collect()
-            .to_pandas()
-        )
-        vep_start_lost_snv = vep_start_lost[
-            vep_start_lost["allele"].str.len() == 1
-        ].copy()
-        vep_start_lost_snv[["variant_pos_cds", "cds_length"]] = vep_start_lost_snv[
-            "cds_position"
-        ].str.split("/", expand=True)
-        vep_start_lost_snv = vep_start_lost_snv[
-            vep_start_lost_snv["variant_pos_cds"].str.len() == 1
-        ]
-        vep_start_lost_snv["variant_pos_cds"] = vep_start_lost_snv[
-            "variant_pos_cds"
-        ].astype(int)
-        vep_start_lost_snv["cds_length"] = vep_start_lost_snv["cds_length"].astype(int)
-        vep_start_lost_snv["Chromosome"] = vep_start_lost_snv["chrom"].str.replace(
-            r"^(?!chr)", "chr", regex=True
-        )
+    # logger.info("Processing start_lost variants for next in-frame ATG")
+    # schema_names = annos.collect_schema().names()
+    # if "consequence_start_lost" in schema_names:
+    #     vep_start_lost = (
+    #         annos.filter(pl.col("consequence_start_lost") == 1)
+    #         .select(
+    #             [
+    #                 "pos",
+    #                 "chrom",
+    #                 "gene",
+    #                 "id",
+    #                 "cds_position",
+    #                 "codons",
+    #                 "strand",
+    #                 "allele",
+    #             ]
+    #         )
+    #         .collect()
+    #         .to_pandas()
+    #     )
+    #     vep_start_lost_snv = vep_start_lost[
+    #         vep_start_lost["allele"].str.len() == 1
+    #     ].copy()
+    #     vep_start_lost_snv[["variant_pos_cds", "cds_length"]] = vep_start_lost_snv[
+    #         "cds_position"
+    #     ].str.split("/", expand=True)
+    #     vep_start_lost_snv = vep_start_lost_snv[
+    #         vep_start_lost_snv["variant_pos_cds"].str.len() == 1
+    #     ]
+    #     vep_start_lost_snv["variant_pos_cds"] = vep_start_lost_snv[
+    #         "variant_pos_cds"
+    #     ].astype(int)
+    #     vep_start_lost_snv["cds_length"] = vep_start_lost_snv["cds_length"].astype(int)
+    #     vep_start_lost_snv["Chromosome"] = vep_start_lost_snv["chrom"].str.replace(
+    #         r"^(?!chr)", "chr", regex=True
+    #     )
 
-        logger.info(f"Processing {len(vep_start_lost_snv)} start_lost SNVs")
-        strands_pos = get_regions_positive_strand(vep_start_lost_snv, fasta_path)
-        strands_neg = get_regions_negative_strand(vep_start_lost_snv, fasta_path)
-        start_lost_df = pd.concat([strands_pos, strands_neg])
-        start_lost_df["next_in_frame"] = start_lost_df.apply(
-            lambda x: next_inframe_start_codon_distance(x["seq"], search_init=3), axis=1
-        )
-        start_lost_df["next_in_frame_relative"] = (
-            start_lost_df["next_in_frame"] / start_lost_df["cds_length"]
-        )
-        start_lost_df.loc[
-            start_lost_df["next_in_frame_relative"] < 0, "next_in_frame_relative"
-        ] = 1
-        start_lost_pl = pl.DataFrame(
-            start_lost_df[["gene", "id", "next_in_frame_relative"]]
-        )
-        annos = annos.join(
-            start_lost_pl.lazy(), on=["id", "gene", "feature"], how="left", validate="1:1"
-        )
+    #     logger.info(f"Processing {len(vep_start_lost_snv)} start_lost SNVs")
+    #     strands_pos = get_regions_positive_strand(vep_start_lost_snv, fasta_path)
+    #     strands_neg = get_regions_negative_strand(vep_start_lost_snv, fasta_path)
+    #     start_lost_df = pd.concat([strands_pos, strands_neg])
+    #     start_lost_df["next_in_frame"] = start_lost_df.apply(
+    #         lambda x: next_inframe_start_codon_distance(x["seq"], search_init=3), axis=1
+    #     )
+    #     start_lost_df["next_in_frame_relative"] = (
+    #         start_lost_df["next_in_frame"] / start_lost_df["cds_length"]
+    #     )
+    #     start_lost_df.loc[
+    #         start_lost_df["next_in_frame_relative"] < 0, "next_in_frame_relative"
+    #     ] = 1
+    #     start_lost_pl = pl.DataFrame(
+    #         start_lost_df[["gene", "id", "next_in_frame_relative"]]
+    #     )
+    #     annos = annos.join(
+    #         start_lost_pl.lazy(), on=["id", "gene", "feature"], how="left", validate="1:1"
+    #     )
 
-    # ── SpliceAI max delta score ───────────────────────────────────────────
+    # # ── SpliceAI max delta score ───────────────────────────────────────────
+    # logger.info("Processing SpliceAI predictions")
+    # if "spliceai_pred" in annos.collect_schema().names():
+    #     annos = annos.with_columns(
+    #         pl.col("spliceai_pred")# there are multiple predictions
+    #         .str.split("|")
+    #         .list.slice(1, 4)
+    #         .list.eval(pl.element().cast(pl.Float32, strict=False))
+    #         .list.max()
+    #         .alias("spliceai_delta_score")
+    #     ).drop("spliceai_pred")
+
+     # ── SpliceAI max delta score ───────────────────────────────────────────
+    # SpliceAI comes as separate columns: spliceai_pred_ds_{ag,al,dg,dl} (delta scores, 0-1) and spliceai_pred_dp_{ag,al,dg,dl} (positions). 
     logger.info("Processing SpliceAI predictions")
-    if "spliceai_pred" in annos.collect_schema().names():
+    schema_names = annos.collect_schema().names()
+    ds_cols = [f"spliceai_pred_ds_{s}" for s in SPLICE if f"spliceai_pred_ds_{s}" in schema_names]
+    if ds_cols:
         annos = annos.with_columns(
-            pl.col("spliceai_pred")
-            .str.split("|")
-            .list.slice(1, 4)
-            .list.eval(pl.element().cast(pl.Float32, strict=False))
-            .list.max()
-            .alias("spliceai_delta_score")
-        ).drop("spliceai_pred")
+            spliceai_delta_score=pl.max_horizontal(
+                [pl.col(c).cast(pl.Float32, strict=False) for c in ds_cols]
+            )
+        ).drop([c for c in schema_names if c.startswith("spliceai_pred_")])
+        logger.info(f"  spliceai_delta_score from {ds_cols}")
+    else:
+        logger.warning("  No spliceai_pred_ds_* columns found; skipping SpliceAI")
+ 
 
     # ── BLOSUM62 scores for missense substitutions ────────────────────────
     logger.info("Computing BLOSUM62 scores")
