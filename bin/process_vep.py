@@ -24,7 +24,8 @@ logging.basicConfig(
 )
 
 SPLICE = ["ag", "al", "dg", "dl"]
-CASTS = {
+# Fixed casts only; gnomAD columns are added per frame inside the function
+BASE_CASTS = {
     "POS": pl.Int32, "QUAL": pl.Float32, "AC": pl.Int32, "AN": pl.Int32, "AF": pl.Float32,
     "distance": pl.Int32,
     "strand": pl.Int8,
@@ -36,8 +37,8 @@ CASTS = {
                                "max_af", "cadd_phred", "cadd_raw", "revel"]},
     **{f"spliceai_pred_ds_{s}": pl.Float32 for s in SPLICE},
     **{f"spliceai_pred_dp_{s}": pl.Int16 for s in SPLICE},
-    **{c: pl.Float32 for c in annos.columns if c.startswith("gnomadg")},
-    }
+}
+
 
 ANN_COLUMNS = [
     "ANN",
@@ -161,22 +162,11 @@ def convert_to_int_and_get_max(value):
 
 # ------------- 1. concatenate all shards of annotations into a single DataFrame and write to a parquet file
 def concat_annotations(shards_dir: list[str], out_file: str):
-    """Concatenate shards of annotations into a single DataFrame and write to a parquet file."""
-    # there can be multiple shards folderes f (value in list shards_dir), each containing the annotation files like do:
-    # {f}/shard-{*}/subshard-{*}/annotations.parquet
-    # all_shards should be a list of the paths to   all the parquet files in all the shards folders
+    """Concatenate shards of annotations into a single parquet file."""
     all_shards = []
-
     for f in shards_dir:
         all_shards.extend(
-            glob.glob(
-                os.path.join(
-                    f,
-                    "shard-*",
-                    "subshard-*",
-                    "annotations.parquet",
-                )
-            )
+            glob.glob(os.path.join(f, "shard-*", "subshard-*", "annotations.parquet"))
         )
 
     if not all_shards:
@@ -184,21 +174,26 @@ def concat_annotations(shards_dir: list[str], out_file: str):
 
     logger.info(f"Found {len(all_shards)} parquet files")
     logger.info(f"Writing concatenated annotations to {out_file}")
-    #Ints and floats to 32, binary booleans
-
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
-    # drop 
-    (pl.scan_parquet(all_shards)
-        .drop(ANN_COLUMNS).drop(VEP_TO_DROP) # alternatively: select?
-        .unique(subset=["ID", "feature"])
+
+    lf = pl.scan_parquet(all_shards).drop(ANN_COLUMNS).drop(VEP_TO_DROP)
+    names = lf.collect_schema().names()
+
+    casts = {
+        **{c: t for c, t in BASE_CASTS.items() if c in names},
+        **{c: pl.Float32 for c in names if c.startswith("gnomadg")},
+    }
+
+    (
+        lf.unique(subset=["ID", "feature"])
         .filter(
             (
                 pl.col("ALT").str.len_chars().cast(pl.Int64)
-                - pl.col("REF").str.len_chars().cast(pl.Int64)# int 32 makes negative falues large
-            ).abs() > 50
+                - pl.col("REF").str.len_chars().cast(pl.Int64)
+            ).abs() < 50
         )
         .with_columns(
-            [pl.col(c).cast(t, strict=False) for c, t in CASTS.items()]
+            pl.col(c).replace(["-", ""], None).cast(t) for c, t in casts.items()
         )
         .sink_parquet(out_file, engine="streaming")
     )
