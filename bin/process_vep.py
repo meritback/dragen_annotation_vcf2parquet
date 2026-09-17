@@ -268,60 +268,6 @@ def process_vep(
     if sanity_check:
         for col in ("chrom", "pos", "ref", "alt"):
             assert vep_file.select(pl.col(col).is_null().sum()).collect().item() == 0
-
-    # ── Consequence dummies ────────────────────────────────────────────────
-    logger.info("Creating consequence dummy variables")
-
-    dummies = (
-        vep_file
-        .select("consequence")
-        .unique()  # reduce Memory usage for the explode step
-        .with_columns(
-            pl.col("consequence")
-            .str.split(",")
-            .alias("_consequence")
-        )
-        .explode("_consequence")
-        .filter(
-            pl.col("_consequence").is_not_null()
-            & (pl.col("_consequence") != "")
-        )
-        .collect()
-        .to_dummies(columns="_consequence")
-        .group_by("consequence")
-        .max()
-    )
-
-    # restore your original naming convention:
-    # consequence_missense_variant, etc.
-    dummies = dummies.rename({
-        c: c.replace("_consequence_", "consequence_")
-        for c in dummies.columns
-        if c.startswith("_consequence_")
-    })
-
-    logger.info(f"Created {len(dummies.columns) - 1} consequence dummy columns")
-
-    vep_file = vep_file.join(
-        dummies.lazy(),
-        on="consequence",
-        how="left",
-    )
-
-    vep_file = vep_file.rename(
-        {col: col.lower() for col in vep_file.collect_schema().names()}
-    )
-
-    dtype_update = {
-        col: pl.Int8
-        for col in vep_file.collect_schema().names()
-        if col.startswith("consequence_")
-    }
-    dtype_update["strand"] = pl.Utf8
-
-    vep_file = vep_file.with_columns(
-        [pl.col(col).cast(dtype) for col, dtype in dtype_update.items()]
-    )
     
     # ── Consequence dummies ────────────────────────────────────────────────
     logger.info("Creating consequence dummy variables")
