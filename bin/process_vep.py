@@ -352,6 +352,39 @@ def _cds_start_expr() -> pl.Expr:
     """
     return pl.col("cds_position").str.extract(r"^(\d+)").cast(pl.Int64)
  
+
+def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
+    """Per-transcript CDS segments from GTF 'CDS' rows.
+
+    Returns one row per CDS segment: _tx, chrom, start, end, strand, _cds_start_nf.
+    Unlike add_more_annotations.py (gene-level, which double-counts exons shared
+    by isoforms), this is keyed by transcript, matching VEP's `feature` column.
+    chrY PAR copies are dropped so each transcript maps to one chromosome.
+    """
+    cds = (
+        gtf.filter(pl.col("feature") == "CDS")
+        .with_columns(
+            transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
+            _cds_start_nf=pl.col("attributes").str.contains(r'tag "cds_start_NF"'),
+        )
+        .filter(
+            pl.col("transcript_id").is_not_null()
+            & ~pl.col("transcript_id").str.ends_with("_PAR_Y")
+        )
+        .with_columns(_tx=_tx_key("transcript_id"))
+    )
+    tx_chrom = (
+        cds.select("_tx", "chrom").unique()
+        .sort(["_tx", pl.col("chrom") == "chrY"])
+        .unique(subset="_tx", keep="first", maintain_order=True)
+    )
+    return (
+        cds.join(tx_chrom, on=["_tx", "chrom"], how="semi")
+        .select("_tx", "chrom", "start", "end", "strand", "_cds_start_nf")
+    )
+
+
+
  
 def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
     """Sum CDS exon lengths per transcript.
@@ -650,19 +683,19 @@ def process_vep(
     annos = pl.scan_parquet(tmp).drop(gnomad_cols)
 
     # -------- was not run with --total_length, so cds_position is just the start (or range) of the variant in the CDS
-    # GENCODE GTF v49 (match vep115)
+        # ── GENCODE v49 GTF (VEP 115) ─────────────────────────────────────────
     logger.info(f"Loading GTF {gtf_path}")
     gtf = _load_gtf_polars(gtf_path)
-    gene_features = _gtf_gene_features(gtf)
-
-    cds_segments = _gtf_transcript_cds(gtf)
-    cds_length_df = _gtf_transcript_cds_length(cds_segments)
+    genes = _gtf_gene_features(gtf)
+    tx_cds_len = _gtf_transcript_cds_length(gtf)
     del gtf
     gc.collect()
     logger.info(
-        f"  GTF: {gene_features.height} protein-coding genes, "
-        f"{cds_length_df.height} transcripts with CDS"
+        f"  GTF: {genes.height} protein-coding genes, "
+        f"{tx_cds_len.height} transcripts with CDS"
     )
+
+    # ── relative_cds_position: cds_start / total CDS length ───────────────
     # As in add_more_annotations.py, but the CDS length is per transcript
     # (joined on `feature`), because there is one row per transcript.
     logger.info("Computing relative CDS positions (cds_start / GTF CDS length)")
@@ -873,6 +906,30 @@ def process_vep(
         ).cast(pl.Int8),
     )
 
+    # TODO: check if this is needed
+    # # ── Set region = gene (required for TSS and downstream joins) ─────────
+    # annos = annos.with_columns(region=pl.col("gene"))
+
+    # # ── dist_to_tss, gene_length, gene_name (add_more_annotations.py step0b) ──
+    # # One TSS per gene; each transcript row gets its gene's TSS (m:1 join).
+    # logger.info("Calculating distance to TSS")
+    # annos = (
+    #     _idempotent_join(annos, genes.lazy(), on=["region"], validate="m:1")
+    #     .with_columns(
+    #         dist_to_tss=pl.when(pl.col("_gene_strand") == "+")
+    #         .then(pl.col("pos") - pl.col("_tss"))
+    #         .otherwise(pl.col("_tss") - pl.col("pos"))
+    #     )
+    #     .drop(["_tss", "_gene_strand"])
+    # )
+    # logger.info("  dist_to_tss / gene_length / gene_name OK")
+
+    # logger.info(f"Writing VEP-processed annotations to {output_path}")
+    # Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    # annos.sink_parquet(output_path, engine="streaming")
+    # logger.info("VEP processing complete")
+    # tmp.unlink(missing_ok=True)
+
     # ── Set region = gene (required for TSS and downstream joins) ─────────
     annos = annos.with_columns(region=pl.col("gene"))
 
@@ -905,6 +962,7 @@ def process_vep(
     )
     anno_tss = anno_tss.rename({col: col.lower() for col in anno_tss.columns})
     annos = annos.join(anno_tss.lazy(), on=["id", "pos", "region"], how="left")
+    annos = annos.unique(subset=["id", "gene", "region", "feature"])
 
     logger.info(f"Writing VEP-processed annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -919,7 +977,9 @@ def process_vep(
 def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
     """Merge GPN-MSA scores for all chromosomes (one job)."""
     logger.info("Loading annotations for GPN-MSA")
-    vm = pl.read_parquet(variant_metadata_path, columns=["id", "chrom"])
+    vm = pl.read_parquet(variant_metadata_path, columns=["id", "chrom"]).with_columns(
+        pl.col("chrom").cast(pl.String)
+    )
 
     scores_lazy = pl.scan_parquet(scores_gpn_msa_file)
     unique_chroms = vm["chrom"].unique().to_list()
@@ -1262,11 +1322,14 @@ def fill_nulls(input_path, annotation_specs, cols_to_keep, output_path):
 
 
 # main function to run all steps
-def main(config_path):
+def main(config_path, config_general_path):
     # Paths
     # Load config
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+
+    with open(config_general_path, "r") as f:
+        config_general = yaml.safe_load(f)
 
     # Input paths
     input_files = config["input_files"]
@@ -1279,6 +1342,7 @@ def main(config_path):
     BLOSUM_PATH = input_files["blosum_path"]
     FASTA_PATH = input_files["FASTA_PATH"]
     GTF_PATH = input_files["GTF_PATH"]
+    CADD_PATH = input_files["CADD_PATH"]
 
     # Output paths
     output_files = config["output_files"]
@@ -1298,15 +1362,27 @@ def main(config_path):
     OUT_GPN_MSA = os.path.expanduser(
         output_files["OUT_GPN_MSA"]
     )
+    OUT_PRE_CADD = os.path.expanduser(
+        output_files["OUT_PRE_CADD"]
+    )
+    OUT_CADD = os.path.expanduser(
+        output_files["OUT_CADD"]
+    )
+    OUT_CADD_NA = os.path.expanduser(
+        output_files["OUT_CADD_NA"]
+    )
+
     logger.info(f"SHARDS_DIR: {SHARDS_DIR}")
     logger.info(f"BLOSUM_PATH: {BLOSUM_PATH}")
     logger.info(f"FASTA_PATH: {FASTA_PATH}")
     logger.info(f"GTF_PATH: {GTF_PATH}")
+    logger.info(f"CADD_PATH: {CADD_PATH}")
     logger.info(f"OUT_CONCAT_ANNOTATIONS: {OUT_CONCAT_ANNOTATIONS}")
     logger.info(f"OUT_VAR_METADATA: {OUT_VAR_METADATA}")
     logger.info(f"OUT_PROCESS_VEP: {OUT_PROCESS_VEP}")
-
-
+    logger.info(f"GPN_MSA_SCORES: {GPN_MSA_SCORES}")
+    logger.info(f"OUT_GPN_MSA: {OUT_GPN_MSA}")
+    logger.info(f"OUT_CADD: {OUT_CADD}")
     concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
     write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
     process_vep(
@@ -1318,18 +1394,19 @@ def main(config_path):
         OUT_PROCESS_VEP
     )
     # YET TO DO
-    # merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
-    # merge_all_pre_cadd(vep_processed_path, gpn_msa_path)
-    # merge_cadd(nocadd_path  = input.nocadd,
-    #         cadd_file    = input.cadd,
-    #         annotation_columns = config["annotation_columns"],
-    #         output_path  = output[0],)
-    # fill_nulls(
-    #     input_path         = input[0],
-    #     annotation_specs = config["annotation_specs"],
-    #     cols_to_keep       = config["annotation_columns"],
-    #     output_path        = output[0],
-    # )
+    merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
+    merge_all_pre_cadd(OUT_PROCESS_VEP, OUT_GPN_MSA, OUT_PRE_CADD)
+    merge_cadd(nocadd_path  = OUT_PRE_CADD,
+            cadd_file    = CADD_PATH,
+            annotation_columns = config_general["annotation_columns"],
+            output_path  = OUT_CADD)
+            
+    fill_nulls(
+        input_path         = OUT_CADD,
+        annotation_specs = config_general["annotation_specs"],
+        cols_to_keep       = config_general["annotation_columns"],
+        output_path        = OUT_CADD_NA,
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1338,6 +1415,11 @@ if __name__ == "__main__":
         default="config.yaml",
         help="Path to config YAML file",
     )
+    parser.add_argument(
+        "--config_general",
+        default="config_general.yaml",
+        help="Path to config_general YAML file",
+    )
     args = parser.parse_args()
 
-    main(args.config)
+    main(args.config, args.config_general)
