@@ -24,17 +24,35 @@ logging.basicConfig(
 )
 
 SPLICE = ["ag", "al", "dg", "dl"]
-# Fixed casts only; gnomAD columns are added per frame inside the function
+
+# Fixed casts only, gnomAD columns are added per frame inside the function
 BASE_CASTS = {
-    "POS": pl.Int32, "QUAL": pl.Float32, "AC": pl.Int32, "AN": pl.Int32, "AF": pl.Float32,
+    "POS": pl.Int32,
+    "QUAL": pl.Float32,
+    "AC": pl.Int32,
+    "AN": pl.Int32,
+    "AF": pl.Float32,
     "distance": pl.Int32,
     # "strand": pl.Int8,
     "tsl": pl.Int8,
     "existing_inframe_oorfs": pl.Int16,
     "existing_outofframe_oorfs": pl.Int16,
     "existing_uorfs": pl.Int16,
-    **{c: pl.Float32 for c in ["af_2", "afr_af", "amr_af", "eas_af", "eur_af", "sas_af",
-                               "max_af", "cadd_phred", "cadd_raw", "revel"]},
+    **{
+        c: pl.Float32
+        for c in [
+            "af_2",
+            "afr_af",
+            "amr_af",
+            "eas_af",
+            "eur_af",
+            "sas_af",
+            "max_af",
+            "cadd_phred",
+            "cadd_raw",
+            "revel",
+        ]
+    },
     **{f"spliceai_pred_ds_{s}": pl.Float32 for s in SPLICE},
     **{f"spliceai_pred_dp_{s}": pl.Int16 for s in SPLICE},
 }
@@ -57,10 +75,13 @@ ANN_COLUMNS = [
     "aa_pos_aa_length",
     "errors_warnings_info",
 ]
-VEP_TO_DROP = ["mechpredict_pdn",
+
+VEP_TO_DROP = [
+    "mechpredict_pdn",
     "mechpredict_pgof",
     "mechpredict_plof",
-    "mechpredict_prediction"]
+    "mechpredict_prediction",
+]
 
 
 # https://github.com/HolEv/deeprvat_wgs/blob/main/scripts/annotation/annotation_functions.py
@@ -120,7 +141,6 @@ def _load_gtf_polars(gtf_path: str) -> pl.DataFrame:
         ignore_errors=True,
     )
  
- 
 def _gtf_gene_features(gtf: pl.DataFrame) -> pl.DataFrame:
     """Per-gene TSS, length and name from GTF 'gene' rows (protein-coding only).
  
@@ -146,8 +166,7 @@ def _gtf_gene_features(gtf: pl.DataFrame) -> pl.DataFrame:
         .select(["region", "gene_name", "gene_length", "_tss", "_gene_strand"])
         .unique(subset=["region"])
     )
- 
- 
+
 def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
     """Per-gene TSS of the MANE Select transcript (GTF 'transcript' rows).
  
@@ -155,7 +174,7 @@ def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
     tagged Ensembl_canonical. Used for dist_to_tss_v39 against a GENCODE v39
     GTF so the promoter region matches PromoterAI's benchmark definition.
  
-    Returns one row per gene: region, _tss_v39, _gene_strand_v39.
+    Returns one row per gene: region, _tss_v49, _gene_strand_v49.
     """
     tx = (
         gtf.filter(pl.col("feature") == "transcript")
@@ -167,10 +186,10 @@ def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
             _is_mane=pl.col("attributes").str.contains(r'tag "MANE_Select"'),
             _is_canonical=pl.col("attributes")
                   .str.contains(r'tag "Ensembl_canonical"'),
-            _tss_v39=pl.when(pl.col("strand") == "+")
+            _tss_v49=pl.when(pl.col("strand") == "+")
                   .then(pl.col("start"))
                   .otherwise(pl.col("end")),
-            _gene_strand_v39=pl.col("strand"),
+            _gene_strand_v49=pl.col("strand"),
         )
         # Same protein-coding restriction as _gtf_gene_features: Ensembl_canonical
         # (the fallback) also tags lncRNAs / pseudogenes, which are not in scope.
@@ -184,12 +203,11 @@ def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
     )
     n_mane = int(tx.select(pl.col("_is_mane").sum()).item())
     logger.info(
-        f"  v39 MANE/canonical TSS: {tx.height} genes "
+        f"  v49 MANE/canonical TSS: {tx.height} genes "
         f"({n_mane} MANE Select, {tx.height - n_mane} Ensembl_canonical fallback)"
     )
-    return tx.select(["region", "_tss_v39", "_gene_strand_v39"])
- 
- 
+    return tx.select(["region", "_tss_v49", "_gene_strand_v49"])
+
 def _idempotent_join(
     left: pl.LazyFrame,
     right: pl.LazyFrame,
@@ -223,8 +241,8 @@ def _next_inframe_atg_distance(seq: str, search_init: int = 3) -> int:
         if seq[i:i + 3].upper() == "ATG":
             return i
     return -1
- 
- 
+
+
 def _compute_next_in_frame(
     annos: pl.LazyFrame,
     tx_cds_len: pl.DataFrame,
@@ -257,7 +275,7 @@ def _compute_next_in_frame(
     if missing:
         logger.warning(f"  next_in_frame: missing columns {missing}; skipping")
         return annos
- 
+    
     # ── Subset to start_lost SNVs with usable cds_start ──────────────────
     start_lost = (
         annos
@@ -287,6 +305,7 @@ def _compute_next_in_frame(
     # ── Fetch sequences and find next ATG ────────────────────────────────
     fasta = pyfaidx.Fasta(fasta_path, sequence_always_upper=True)
     records = []
+
     for row in start_lost.iter_rows(named=True):
         keys      = {"id": row["id"], "gene": row["gene"], "feature": row["feature"]}
         chrom     = str(row["chrom"])
@@ -352,7 +371,6 @@ def _cds_start_expr() -> pl.Expr:
     """
     return pl.col("cds_position").str.extract(r"^(\d+)").cast(pl.Int64)
  
-
 def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
     """Per-transcript CDS segments from GTF 'CDS' rows.
 
@@ -383,9 +401,6 @@ def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
         .select("_tx", "chrom", "start", "end", "strand", "_cds_start_nf")
     )
 
-
-
- 
 def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
     """Sum CDS exon lengths per transcript.
  
@@ -517,6 +532,7 @@ def concat_annotations(shards_dir: list[str], out_file: str):
 
     logger.info("Finished concatenating annotations")
 
+
 # ------------- 2. write variant metadata to a parquet file
 def write_variant_metadata(annotations_file: str, out_file: str):
     annos = pl.scan_parquet(annotations_file)
@@ -538,6 +554,7 @@ def process_vep(
     gene_filters=None,
     n_samples=None,
     sanity_check=False,
+    region="gene", # can be transcript or gene
 ):
     """
     # annotations contains CHROM POS REF ALT ID CONSEQUENCE etc
@@ -585,7 +602,7 @@ def process_vep(
     if sanity_check:
         for col in ("chrom", "pos", "ref", "alt"):
             assert vep_file.select(pl.col(col).is_null().sum()).collect().item() == 0
-    
+        
     # ── Consequence dummies ────────────────────────────────────────────────
     logger.info("Creating consequence dummy variables")
     vep_file = vep_file.with_row_index("row_nr")
@@ -680,12 +697,17 @@ def process_vep(
 
     tmp = Path(output_path).with_suffix(".stage1.parquet")
     annos.sink_parquet(tmp, engine="streaming")
-    annos = pl.scan_parquet(tmp).drop(gnomad_cols)
+    gnomad_cols = [
+        c for c in annos.collect_schema().names()
+        if c.startswith(("gnomadg_"))
+    ]
+    annos = pl.scan_parquet(tmp)
+    annos = annos.drop(gnomad_cols)
 
-    # -------- was not run with --total_length, so cds_position is just the start (or range) of the variant in the CDS
+    #-------- was not run with --total_length, so cds_position is just the start (or range) of the variant in the CDS
         # ── GENCODE v49 GTF (VEP 115) ─────────────────────────────────────────
     logger.info(f"Loading GTF {gtf_path}")
-    gtf = _load_gtf_polars(gtf_path)
+    gtf = _load_gtf_polars(gtf_path) # TODO: add gene and transcript option
     genes = _gtf_gene_features(gtf)
     tx_cds_len = _gtf_transcript_cds_length(gtf)
     del gtf
@@ -868,7 +890,7 @@ def process_vep(
     # logger.info("Processing 5' UTR variant consequence annotations")
     # if "five_prime_utr_variant_consequence" in annos.collect_schema().names():
     #     utr_df = annos.select(
-    #         ""id", "gene", "feature" "five_prime_utr_variant_consequence"
+    #         "id", "gene", "five_prime_utr_variant_consequence"
     #     ).with_row_index("row_nr")
     #     dummies = (
     #         utr_df.select(["row_nr", "five_prime_utr_variant_consequence"])
@@ -884,11 +906,11 @@ def process_vep(
     #         .max()
     #     )
     #     utr_df = (
-    #         utr_df.select("id", "gene", "feature", "row_nr")
+    #         utr_df.select("id", "gene", "row_nr")
     #         .join(dummies.lazy(), on="row_nr", how="left")
     #         .drop("row_nr")
     #     )
-    #     annos = annos.join(utr_df, on=["id", "gene", "feature"], how="left", validate="1:1")
+    #     annos = annos.join(utr_df, on=["id", "gene"], how="left", validate="1:1")
 
     # ── Variant length / indel flags ──────────────────────────────────────
     logger.info("Computing variant lengths and indel flags")
@@ -906,41 +928,17 @@ def process_vep(
         ).cast(pl.Int8),
     )
 
-    # TODO: check if this is needed
-    # # ── Set region = gene (required for TSS and downstream joins) ─────────
-    # annos = annos.with_columns(region=pl.col("gene"))
-
-    # # ── dist_to_tss, gene_length, gene_name (add_more_annotations.py step0b) ──
-    # # One TSS per gene; each transcript row gets its gene's TSS (m:1 join).
-    # logger.info("Calculating distance to TSS")
-    # annos = (
-    #     _idempotent_join(annos, genes.lazy(), on=["region"], validate="m:1")
-    #     .with_columns(
-    #         dist_to_tss=pl.when(pl.col("_gene_strand") == "+")
-    #         .then(pl.col("pos") - pl.col("_tss"))
-    #         .otherwise(pl.col("_tss") - pl.col("pos"))
-    #     )
-    #     .drop(["_tss", "_gene_strand"])
-    # )
-    # logger.info("  dist_to_tss / gene_length / gene_name OK")
-
-    # logger.info(f"Writing VEP-processed annotations to {output_path}")
-    # Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    # annos.sink_parquet(output_path, engine="streaming")
-    # logger.info("VEP processing complete")
-    # tmp.unlink(missing_ok=True)
-
-    # ── Set region = gene (required for TSS and downstream joins) ─────────
-    annos = annos.with_columns(region=pl.col("gene"))
+    # ── Set region = transcript/feature (transcript-specific TSS) ─────────
+    annos = annos.with_columns(region=pl.col(region))
 
     # ── Distance to TSS ───────────────────────────────────────────────────
     logger.info("Calculating distance to TSS")
     gencode_pr = pr.read_gtf(gtf_path, as_df=True)
     gencode_pl = pl.from_pandas(gencode_pr).filter(
-        pl.col("gene_type") == "protein_coding"
+        pl.col("gene_type").is_in(biotypes)
     )
-    gencode_genes = gencode_pl.filter(pl.col("Feature") == "gene").with_columns(
-        region=pl.col("gene_id").str.split(".").list.first()
+    gencode_genes = gencode_pl.filter(pl.col("Feature") == region).with_columns(
+        region=pl.col(f"{region}_id").str.split(".").list.first()
     )
     tss_df = gencode_genes.with_columns(
         gene_length=pl.col("End") - pl.col("Start") + 1,
@@ -948,8 +946,9 @@ def process_vep(
         .then(pl.col("Start"))
         .otherwise(pl.col("End")),
     ).select(["tss", "Strand", "gene_length", "region"]).unique(subset="region")
+ 
 
-    logger.info("Joining distance to TSS")
+    logger.info("Joining distance to transcript-specific TSS")
     anno_tss = (
         annos.select(["id", "pos", "region"])
         .join(tss_df.lazy(), on="region", how="left")
@@ -962,7 +961,7 @@ def process_vep(
     )
     anno_tss = anno_tss.rename({col: col.lower() for col in anno_tss.columns})
     annos = annos.join(anno_tss.lazy(), on=["id", "pos", "region"], how="left")
-    annos = annos.unique(subset=["id", "gene", "region", "feature"])
+    annos = annos.unique(subset=["id", "gene", "region"])
 
     logger.info(f"Writing VEP-processed annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -977,9 +976,7 @@ def process_vep(
 def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
     """Merge GPN-MSA scores for all chromosomes (one job)."""
     logger.info("Loading annotations for GPN-MSA")
-    vm = pl.read_parquet(variant_metadata_path, columns=["id", "chrom"]).with_columns(
-        pl.col("chrom").cast(pl.String)
-    )
+    vm = pl.read_parquet(variant_metadata_path, columns=["id", "chrom"])
 
     scores_lazy = pl.scan_parquet(scores_gpn_msa_file)
     unique_chroms = vm["chrom"].unique().to_list()
@@ -989,7 +986,7 @@ def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
     for chrom in unique_chroms:
         gpn_chrom = chrom.lstrip("chr")
         scores_chr = (
-            scores_lazy.filter(pl.col("chrom").str.to_lowercase() == gpn_chrom.lower())
+            scores_lazy.filter(pl.col("chrom").cast(pl.String).str.to_lowercase() == gpn_chrom.lower())
             .with_columns(pl.lit(f"chr{gpn_chrom}").alias("chrom"))
             .with_columns(
                 pl.concat_str(
@@ -1004,7 +1001,7 @@ def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
             )
             .select("id", "gpn_score")
         )
-        sampled_chrom = vm.filter(pl.col("chrom").str.to_lowercase() == chrom.lower()).select("id").lazy()
+        sampled_chrom = vm.filter(pl.col("chrom").cast(pl.String).str.to_lowercase() == chrom.lower()).select("id").lazy()
         merged = sampled_chrom.join(scores_chr, on="id", how="left").collect()
         all_scores.append(merged)
         logger.info(f"  GPN-MSA done for {chrom}")
@@ -1094,18 +1091,18 @@ def merge_all_pre_cadd(
     #     )
     #     .rename({"gene": "gene_name", "gene_id": "gene", "promoterAI": "promoterai"})
     #     .with_columns(pl.col("promoterai").abs().alias("promoterai_abs"))
-    #     .select("promoterai", "promoterai_abs", "id", "gene", "feature")
+    #     .select("promoterai", "promoterai_abs", "id", "gene")
     # )
     # scores = annos.select("gene", "id").join(
-    #     promoter_ai, how="left", on=["id", "gene", "feature"], validate="1:m"
+    #     promoter_ai, how="left", on=["id", "gene"], validate="1:m"
     # )
     # scores_grouped = scores.group_by(["gene", "id"]).agg(
     #     pl.col("promoterai").sort_by(pl.col("promoterai_abs"), descending=True).first()
     # )
     # annos = annos.join(
-    #     scores_grouped.select("promoterai", "id", "gene", "feature"),
+    #     scores_grouped.select("promoterai", "id", "gene"),
     #     how="left",
-    #     on=["id", "gene", "feature"],
+    #     on=["id", "gene"],
     #     validate="1:1",
     # )
 
@@ -1318,6 +1315,8 @@ def fill_nulls(input_path, annotation_specs, cols_to_keep, output_path):
     logger.info(f"Writing fill-null annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     annos.sink_parquet(output_path, engine="streaming")
+    annos = annos.filter(pl.col("maf_gnomad")<0.001)
+    annos.sink_parquet(output_path.replace(".parquet", "_maf001.parquet"), engine="streaming")
     logger.info("Done")
 
 
@@ -1362,15 +1361,23 @@ def main(config_path, config_general_path):
     OUT_GPN_MSA = os.path.expanduser(
         output_files["OUT_GPN_MSA"]
     )
+    GPN_MSA_SCORES = os.path.expanduser(
+        output_files["GPN_MSA_SCORES"]
+    )
+
+
     OUT_PRE_CADD = os.path.expanduser(
         output_files["OUT_PRE_CADD"]
     )
+
     OUT_CADD = os.path.expanduser(
         output_files["OUT_CADD"]
     )
+
     OUT_CADD_NA = os.path.expanduser(
         output_files["OUT_CADD_NA"]
     )
+
 
     logger.info(f"SHARDS_DIR: {SHARDS_DIR}")
     logger.info(f"BLOSUM_PATH: {BLOSUM_PATH}")
@@ -1382,7 +1389,10 @@ def main(config_path, config_general_path):
     logger.info(f"OUT_PROCESS_VEP: {OUT_PROCESS_VEP}")
     logger.info(f"GPN_MSA_SCORES: {GPN_MSA_SCORES}")
     logger.info(f"OUT_GPN_MSA: {OUT_GPN_MSA}")
+    logger.info(f"OUT_PRE_CADD: {OUT_PRE_CADD}")
     logger.info(f"OUT_CADD: {OUT_CADD}")
+    logger.info(f"OUT_CADD_NA: {OUT_CADD_NA}")
+
     concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
     write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
     process_vep(
@@ -1391,19 +1401,18 @@ def main(config_path, config_general_path):
         FASTA_PATH,
         GTF_PATH,
         BLOSUM_PATH,
-        OUT_PROCESS_VEP
+        OUT_PROCESS_VEP,
+        config_general["biotypes"]
     )
     # YET TO DO
     merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
     merge_all_pre_cadd(OUT_PROCESS_VEP, OUT_GPN_MSA, OUT_PRE_CADD)
-    # this large CADD file is not available in the repo, so this step is commented out for now
-    # merge_cadd(nocadd_path  = OUT_PRE_CADD,
-    #         cadd_file    = CADD_PATH,
-    #         annotation_columns = config_general["annotation_columns"],
-    #         output_path  = OUT_CADD)
-            
+    # merge_cadd(nocadd_path  = input.nocadd,
+    #         cadd_file    = input.cadd,
+    #         annotation_columns = config["annotation_columns"],
+    #         output_path  = output[0],)
     fill_nulls(
-        input_path         = OUT_PRE_CADD, #OUT_CADD,
+        input_path         = OUT_PRE_CADD,
         annotation_specs = config_general["annotation_specs"],
         cols_to_keep       = config_general["annotation_columns"],
         output_path        = OUT_CADD_NA,
@@ -1419,7 +1428,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_general",
         default="config_general.yaml",
-        help="Path to config_general YAML file",
+        help="Path to general config YAML file",
     )
     args = parser.parse_args()
 
