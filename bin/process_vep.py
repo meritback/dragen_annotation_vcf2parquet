@@ -1402,7 +1402,8 @@ def main(config_path, config_general_path):
         GTF_PATH,
         BLOSUM_PATH,
         OUT_PROCESS_VEP,
-        config_general["biotypes"]
+        config_general["gene_filters"],
+        config_general["region"],
     )
     # YET TO DO
     merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)

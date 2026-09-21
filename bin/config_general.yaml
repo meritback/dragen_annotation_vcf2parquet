@@ -1,3 +1,21 @@
+gene_filters:
+  biotypes:
+    - protein_coding
+
+    # non coding RNA genes
+    # - lncRNA #A non-coding gene/transcript >200bp in length
+    # - miRNA
+    # - misc_RNA
+    # - snRNA
+    # - snoRNA
+    # - scaRNA
+    # - rRNA
+
+  # generated in deeprvat_wgs/bcf2parquet/2_create_input_batch_files.ipynb
+  # genes_to_keep_file: /s/project/deeprvat_wgs/input_data/bcf2parquet/consolidated_file_lists/batch_1_covered_regions.parquet
+
+region: gene   # to do: enable transcript
+
 annotation_columns: #cols_to_keep:
   - id
   - chrom
