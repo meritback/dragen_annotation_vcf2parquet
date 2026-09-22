@@ -64,7 +64,6 @@ ANN_COLUMNS = [
     "annotation_impact",
     "gene_name",
     "gene_id",
-    "feature_type",
     "feature_id",
     "transcript_biotype",
     "rank",
@@ -77,12 +76,78 @@ ANN_COLUMNS = [
 ]
 
 VEP_TO_DROP = [
+    # "clinvar",
+    "clinvar_clndn",
+    "clinvar_clndnincl",
+    "clinvar_clndisdb",
+    "clinvar_clndisdbincl",
+    "clinvar_clnhgvs",
+    "clinvar_clnrevstat",
+    "clinvar_clnsig",
+    "clinvar_clnsigconf",
+    "clinvar_clnsigincl",
+    "clinvar_clnvc",
+    "clinvar_clnvcso",
+    "clinvar_clnvi",
+    "gerp",
+    "QUAL",
+    "FILTER",
+    "AN",
+    "impact",
+    "symbol",
+    "exon",
+    "intron",
+    "hgvsc",
+    "hgvsp",
+    "cdna_position",
+    "existing_variation",
+    "flags",
+    "variant_class",
+    "symbol_source",
+    "hgnc_id",
+    "mane_plus_clinical",
+    "ensp",
+    "swissprot",
+    "trembl",
+    "uniparc",
+    "uniprot_isoform",
+    "gene_pheno",
+    "domains",
+    "hgvs_offset",
+    "af_2",
+    "afr_af",
+    "amr_af",
+    "eas_af",
+    "eur_af",
+    "sas_af",
+    "clin_sig",
+    "somatic",
+    "pheno",
+    "pubmed",
+    "overlapbp",
+    "overlappc",
+    "motif_name",
+    "motif_pos",
+    "high_inf_pos",
+    "motif_score_change",
+    "transcription_factors",
+    "revel",
+    "nmd",
+    "spliceai_pred_dp_ag",
+    "spliceai_pred_dp_al",
+    "spliceai_pred_dp_dg",
+    "spliceai_pred_dp_dl",
+    "spliceai_pred_symbol",
+    "spliceregion",
+    "lof_filter",
+    "lof_flags",
+    "lof_info",
+    "am_class",
     "mechpredict_pdn",
     "mechpredict_pgof",
     "mechpredict_plof",
     "mechpredict_prediction",
 ]
-
 
 # https://github.com/HolEv/deeprvat_wgs/blob/main/scripts/annotation/annotation_functions.py
 
@@ -141,29 +206,30 @@ def _load_gtf_polars(gtf_path: str) -> pl.DataFrame:
         ignore_errors=True,
     )
  
-def _gtf_gene_features(gtf: pl.DataFrame) -> pl.DataFrame:
+def _gtf_region_features(gtf: pl.DataFrame, region="transcript", biotypes=["protein_coding"]) -> pl.DataFrame:
     """Per-gene TSS, length and name from GTF 'gene' rows (protein-coding only).
  
     Returns columns: region, gene_name, gene_length, _tss, _gene_strand.
     """
     return (
-        gtf.filter(pl.col("feature") == "gene")
+        gtf.filter(pl.col("feature") == region)
         .with_columns(
-            region=pl.col("attributes").str.extract(r'gene_id "([^"]+)"')
+            region=pl.col("attributes").str.extract(rf'{region}_id "([^"]+)"')
                   .str.split(".").list.first(),
-            gene_name=pl.col("attributes").str.extract(r'gene_name "([^"]+)"'),
+            # transcript_name=pl.col("attributes").str.extract(rf'transcript_name "([^"]+)"'),
+            # gene_name=pl.col("attributes").str.extract(rf'gene_name "([^"]+)"'),
             gene_type=pl.col("attributes")
                   .str.extract(r'gene_(?:type|biotype) "([^"]+)"'),
         )
-        .filter(pl.col("gene_type") == "protein_coding")
+        .filter(pl.col("gene_type").is_in(biotypes))
         .with_columns(
-            gene_length=pl.col("end") - pl.col("start") + 1,
-            _tss=pl.when(pl.col("strand") == "+")
+            region_length=pl.col("end") - pl.col("start") + 1,
+            tss=pl.when(pl.col("strand") == "+")
                   .then(pl.col("start"))
                   .otherwise(pl.col("end")),
-            _gene_strand=pl.col("strand"),
+            Strand=pl.col("strand"),
         )
-        .select(["region", "gene_name", "gene_length", "_tss", "_gene_strand"])
+        .select(["region", "region_length", "tss", "Strand" ])
         .unique(subset=["region"])
     )
 
@@ -191,7 +257,7 @@ def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
                   .otherwise(pl.col("end")),
             _gene_strand_v49=pl.col("strand"),
         )
-        # Same protein-coding restriction as _gtf_gene_features: Ensembl_canonical
+        # Same protein-coding restriction as _gtf_region_features: Ensembl_canonical
         # (the fallback) also tags lncRNAs / pseudogenes, which are not in scope.
         .filter(
             (pl.col("gene_type") == "protein_coding")
@@ -371,35 +437,35 @@ def _cds_start_expr() -> pl.Expr:
     """
     return pl.col("cds_position").str.extract(r"^(\d+)").cast(pl.Int64)
  
-def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
-    """Per-transcript CDS segments from GTF 'CDS' rows.
+# def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
+#     """Per-transcript CDS segments from GTF 'CDS' rows.
 
-    Returns one row per CDS segment: _tx, chrom, start, end, strand, _cds_start_nf.
-    Unlike add_more_annotations.py (gene-level, which double-counts exons shared
-    by isoforms), this is keyed by transcript, matching VEP's `feature` column.
-    chrY PAR copies are dropped so each transcript maps to one chromosome.
-    """
-    cds = (
-        gtf.filter(pl.col("feature") == "CDS")
-        .with_columns(
-            transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
-            _cds_start_nf=pl.col("attributes").str.contains(r'tag "cds_start_NF"'),
-        )
-        .filter(
-            pl.col("transcript_id").is_not_null()
-            & ~pl.col("transcript_id").str.ends_with("_PAR_Y")
-        )
-        .with_columns(_tx=_tx_key("transcript_id"))
-    )
-    tx_chrom = (
-        cds.select("_tx", "chrom").unique()
-        .sort(["_tx", pl.col("chrom") == "chrY"])
-        .unique(subset="_tx", keep="first", maintain_order=True)
-    )
-    return (
-        cds.join(tx_chrom, on=["_tx", "chrom"], how="semi")
-        .select("_tx", "chrom", "start", "end", "strand", "_cds_start_nf")
-    )
+#     Returns one row per CDS segment: _tx, chrom, start, end, strand, _cds_start_nf.
+#     Unlike add_more_annotations.py (gene-level, which double-counts exons shared
+#     by isoforms), this is keyed by transcript, matching VEP's `feature` column.
+#     chrY PAR copies are dropped so each transcript maps to one chromosome.
+#     """
+#     cds = (
+#         gtf.filter(pl.col("feature") == "CDS")
+#         .with_columns(
+#             transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
+#             _cds_start_nf=pl.col("attributes").str.contains(r'tag "cds_start_NF"'),
+#         )
+#         .filter(
+#             pl.col("transcript_id").is_not_null()
+#             & ~pl.col("transcript_id").str.ends_with("_PAR_Y")
+#         )
+#         .with_columns(_tx=_tx_key("transcript_id"))
+#     )
+#     tx_chrom = (
+#         cds.select("_tx", "chrom").unique()
+#         .sort(["_tx", pl.col("chrom") == "chrY"])
+#         .unique(subset="_tx", keep="first", maintain_order=True)
+#     )
+#     return (
+#         cds.join(tx_chrom, on=["_tx", "chrom"], how="semi")
+#         .select("_tx", "chrom", "start", "end", "strand", "_cds_start_nf")
+#     )
 
 def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
     """Sum CDS exon lengths per transcript.
@@ -412,7 +478,7 @@ def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
     Returns: _tx (ENST without version), cds_length.
     """
     per_chrom = (
-        gtf.filter(pl.col("feature") == "CDS")
+        gtf.filter(pl.col("feature").is_in(["CDS", "stop_codon"]))
         .with_columns(
             transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
             seg_len=pl.col("end") - pl.col("start") + 1,
@@ -423,14 +489,17 @@ def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
         )
         .with_columns(_tx=_tx_key("transcript_id"))
         .group_by(["_tx", "chrom"])
-        .agg(cds_length=pl.col("seg_len").sum())
+        .agg(
+            cds_length=pl.col("seg_len").filter(pl.col("feature") == "CDS").sum(),
+            cds_length_incl_stop=pl.col("seg_len").sum(),
+        )
     )
     # Guard for PAR genes annotated on both chrX and chrY under one ID:
     # keep one copy (non-chrY) instead of summing both.
     return (
         per_chrom.sort(["_tx", pl.col("chrom") == "chrY"])
         .unique(subset=["_tx"], keep="first", maintain_order=True)
-        .select(["_tx", "cds_length"])
+        .select(["_tx", "cds_length", "cds_length_incl_stop"])
     )
 
 # EVA
@@ -460,7 +529,7 @@ def get_regions_negative_strand(variant_df, fasta_path):
         seqs_df["seq"] = pd.Series(dtype=object)
         return seqs_df
     seqs_df["End"] = seqs_df["pos"] + seqs_df["variant_pos_cds"] - 1
-    seqs_df["Start"] = seqs_df["End"] - seqs_df["cds_length"]
+    seqs_df["Start"] = seqs_df["End"] - seqs_df["cds_length_incl_stop"]
     seqs_df["Strand"] = seqs_df["strand"].replace({1: "+", -1: "-"})
     seqs_df["index"] = np.arange(len(seqs_df))
     seqs_pr = pr.PyRanges(seqs_df)
@@ -492,9 +561,115 @@ def convert_to_int_and_get_max(value):
         ints = [int(v) for v in parts if v.isdigit()]
         return max(ints) if ints else None
 
+# ---- RECREATION of TRANSCRIPT ORDER
+"""
+Re-create VEP's `--per_gene --pick_order ...` selection after the fact, on a
+polars table with one row per VEP consequence (CSQ entry).
+
+Mirrors ensembl-vep release/115 OutputFactory.pm:
+  pick_VariationFeatureOverlapAllele_per_gene  -> group transcript rows by gene
+  pick_worst_VariationFeatureOverlapAllele     -> rank each candidate per criterion
+                                                  (0 = best), go through pick_order,
+                                                  keep only the best at each step,
+                                                  remaining ties -> first in VEP order
+Non-transcript rows (regulatory, motif, intergenic) are kept untouched, as VEP does.
+"""
+
+PICK_ORDER = ["biotype", "mane_select", "canonical", "appris", "tsl",
+              "ccds", "rank", "length", "ensembl", "refseq"]
+
+# Consequence ranks from ensembl-variation release/115 Utils/Constants.pm
+# (1..41, no ties; lower = more severe).
+SO_RANK = {term: i for i, term in enumerate([
+    "transcript_ablation", "splice_acceptor_variant", "splice_donor_variant",
+    "stop_gained", "frameshift_variant", "stop_lost", "start_lost",
+    "transcript_amplification", "feature_elongation", "feature_truncation",
+    "inframe_insertion", "inframe_deletion", "missense_variant",
+    "protein_altering_variant", "splice_donor_5th_base_variant",
+    "splice_region_variant", "splice_donor_region_variant",
+    "splice_polypyrimidine_tract_variant", "incomplete_terminal_codon_variant",
+    "start_retained_variant", "stop_retained_variant", "synonymous_variant",
+    "coding_sequence_variant", "mature_miRNA_variant", "5_prime_UTR_variant",
+    "3_prime_UTR_variant", "non_coding_transcript_exon_variant", "intron_variant",
+    "NMD_transcript_variant", "non_coding_transcript_variant",
+    "coding_transcript_variant", "upstream_gene_variant", "downstream_gene_variant",
+    "TFBS_ablation", "TFBS_amplification", "TF_binding_site_variant",
+    "regulatory_region_ablation", "regulatory_region_amplification",
+    "regulatory_region_variant", "intergenic_variant", "sequence_variant",
+], start=1)}
+
+
+def _blank(col):
+    return pl.col(col).is_null() | pl.col(col).is_in(["", "-"])
+
+
+def _flag(cond):
+    """VEP convention: 0 if the transcript has the property, else 1."""
+    return pl.when(cond.fill_null(False)).then(0).otherwise(1)
+
+
+# Same values VEP computes internally (defaults for "missing" included).
+CRITERIA = {
+    "biotype":     _flag(pl.col("biotype") == "protein_coding"),
+    "mane_select": _flag(~_blank("mane_select")
+                         | pl.col("mane").str.contains("MANE_Select")),
+    "canonical":   _flag(pl.col("canonical") == "YES"),
+    # principal N -> N, alternative N -> N + 10, none -> 100  (output shows P1, A2, ...)
+    "appris": (pl.col("appris").str.extract(r"(\d+)").cast(pl.Int32, strict=False)
+               + pl.when(pl.col("appris").str.starts_with("A")).then(10).otherwise(0)
+               ).fill_null(100),
+    "tsl":    pl.col("tsl").str.extract(r"(\d+)").cast(pl.Int32, strict=False).fill_null(100),
+    "ccds":   _flag(~_blank("ccds")),
+    # most severe consequence of this transcript
+    "rank":   pl.col("consequence").str.split("&")
+                .list.eval(pl.element().replace_strict(SO_RANK, default=1000,
+                                                       return_dtype=pl.Int32))
+                .list.min().fill_null(1000),
+    # only informative with --merged (SOURCE column); otherwise a tie, as in VEP
+    "ensembl": _flag(pl.col("source").str.to_lowercase() == "ensembl"),
+    "refseq":  _flag(pl.col("source").str.to_lowercase() == "refseq"),
+}
+
+def vep_per_gene(lf, length_col="cds_length", pick_order=PICK_ORDER,
+                 variant_cols=("CHROM", "POS", "REF", "ALT")):
+    """
+    lf           : (Lazy)DataFrame, one row per VEP consequence entry
+    length_col   : your transcript length column (longer = preferred).
+                   VEP uses CDS length incl. stop codon for transcripts with a
+                   translation, spliced transcript length otherwise.
+    pick_order   : same criteria names as VEP's --pick_order
+    variant_cols : columns identifying one VEP input variant
+    """
+    lf = pl.LazyFrame(lf) if isinstance(lf, pl.DataFrame) else lf
+    lf = lf.with_row_index("_row")          # original (VEP) order = final tie-break
+
+    crit = dict(CRITERIA)
+    # VEP stores -length so that lower = better; missing -> 0 (as VEP's default)
+    crit["length"] = -(pl.col(length_col).cast(pl.Int64, strict=False).fill_null(0))
+
+    keys = [f"_pick_{c}" for c in pick_order]
+    lf = lf.with_columns(**{f"_pick_{c}": crit[c] for c in pick_order})
+
+    # lexicographic minimum over the criteria == VEP's category-by-category elimination
+    group = [*variant_cols, "gene"]
+    picked = pl.col("feature").sort_by([*keys, "_row"]).first().over(group)
+
+    return (
+        lf.filter(pl.col("feature_type").ne_missing("Transcript")
+                  | (pl.col("feature") == picked))
+          .sort("_row")
+          .drop("_row", *keys)
+    )
+
 # ------------- 1. concatenate all shards of annotations into a single DataFrame and write to a parquet file
-def concat_annotations(shards_dir: list[str], out_file: str):
-    """Concatenate shards of annotations into a single parquet file."""
+def concat_annotations(shards_dir: list[str], out_file: str, gene_filters=None):
+    """Concatenate shards of annotations into a single parquet file.
+
+    Gene / biotype filters are applied here, and the gnomAD population AFs are
+    collapsed into a single `maf_gnomad` column (max across populations) before
+    all raw gnomadg_* columns are dropped, so the concatenated file only holds
+    what the downstream steps need.
+    """
     all_shards = []
     for f in shards_dir:
         all_shards.extend(
@@ -510,15 +685,48 @@ def concat_annotations(shards_dir: list[str], out_file: str):
 
     lf = pl.scan_parquet(all_shards).drop(ANN_COLUMNS).drop(VEP_TO_DROP)
     names = lf.collect_schema().names()
+    # Shards keep their original column casing (process_vep lowercases later),
+    # so look up the columns used here case-insensitively.
+    lower_to_name = {c.lower(): c for c in names}
+
+    # ── Gene / biotype filters ─────────────────────────────────────────────
+    if gene_filters is not None:
+        genes_to_keep_file = gene_filters.get("genes_to_keep_file", None)
+        if genes_to_keep_file is not None:
+            logger.info(f"Filtering for genes in file: {genes_to_keep_file}")
+            gdf = pl.read_parquet(genes_to_keep_file)
+            gene_col = next(
+                (c for c in ["gene_id", "gene", "region"] if c in gdf.columns), None
+            )
+            if gene_col is None:
+                raise ValueError(f"No valid gene column in {genes_to_keep_file}")
+            genes_to_keep = gdf[gene_col].unique()
+            lf = lf.filter(pl.col(lower_to_name["gene"]).is_in(genes_to_keep))
+
+        biotypes = gene_filters.get("biotypes", None)
+        if biotypes is not None:
+            logger.info(f"Filtering for biotypes: {biotypes}")
+            lf = lf.filter(pl.col(lower_to_name["biotype"]).is_in(biotypes))
+
+    # ── gnomAD: keep only the max AF across populations ───────────────────
+    gnomad_cols = [c for c in names if c.lower().startswith("gnomadg_")]
+    gnomad_af_cols = [c for c in gnomad_cols if c.lower().startswith("gnomadg_af_")]
+    if not gnomad_af_cols:
+        raise ValueError("No gnomadg_af_* columns found, cannot compute maf_gnomad")
+    logger.info(
+        f"Computing maf_gnomad from {len(gnomad_af_cols)} gnomAD AF columns, "
+        f"dropping {len(gnomad_cols)} gnomadg_* columns"
+    )
 
     casts = {
         **{c: t for c, t in BASE_CASTS.items() if c in names},
-        **{c: pl.Float32 for c in names if c.startswith("gnomadg")},
+        **{c: pl.Float32 for c in gnomad_af_cols},
     }
 
+    # Row-wise steps (length filter, casts, maf_gnomad, gnomAD drop) run before
+    # the unique so it only has to hold the slimmed-down table.
     (
-        lf.unique(subset=["ID", "feature"])
-        .filter(
+        lf.filter(
             (
                 pl.col("ALT").str.len_chars().cast(pl.Int64)
                 - pl.col("REF").str.len_chars().cast(pl.Int64)
@@ -527,6 +735,9 @@ def concat_annotations(shards_dir: list[str], out_file: str):
         .with_columns(
             [pl.col(c).cast(t, strict=False) for c, t in casts.items()]
         )
+        .with_columns(maf_gnomad=pl.max_horizontal(gnomad_af_cols))
+        .drop(gnomad_cols)
+        .unique(subset=["ID", "feature"])
         .sink_parquet(out_file, engine="streaming")
     )
 
@@ -580,24 +791,9 @@ def process_vep(
         {col: col.lower() for col in vep_file.collect_schema().names()}
     )
 
-    # ── Gene / biotype filters ─────────────────────────────────────────────
-    if gene_filters is not None:
-        genes_to_keep_file = gene_filters.get("genes_to_keep_file", None)
-        if genes_to_keep_file is not None:
-            logger.info(f"Filtering for genes in file: {genes_to_keep_file}")
-            gdf = pl.read_parquet(genes_to_keep_file)
-            gene_col = next(
-                (c for c in ["gene_id", "gene", "region"] if c in gdf.columns), None
-            )
-            if gene_col is None:
-                raise ValueError(f"No valid gene column in {genes_to_keep_file}")
-            genes_to_keep = gdf[gene_col].unique()
-            vep_file = vep_file.filter(pl.col("gene").is_in(genes_to_keep))
-
-        biotypes = gene_filters.get("biotypes", None)
-        if biotypes is not None:
-            logger.info(f"Filtering for biotypes: {biotypes}")
-            vep_file = vep_file.filter(pl.col("biotype").is_in(biotypes))
+    # Gene / biotype filters are applied in concat_annotations. biotypes is
+    # still needed below to subset the GTF for the distance-to-TSS step.
+    biotypes = (gene_filters or {}).get("biotypes", None)
 
     if sanity_check:
         for col in ("chrom", "pos", "ref", "alt"):
@@ -641,9 +837,8 @@ def process_vep(
     )
 
     logger.info("Removing duplicate entries")
-    # vep_file = vep_file.unique()
     vep_file = vep_file.unique(
-        subset=["id", "gene", "feature"]
+        subset=["id", "feature"]
     )
 
     # ── Load variant metadata ──────────────────────────────────────────────
@@ -683,169 +878,62 @@ def process_vep(
     #         maf_cohort=pl.col("mac_cohort") / (2 * n_samples)
     #     )
     #     annos = annos.join(maf_df, on="id", how="left", validate="m:1")
-    # -- MAF max of all gnomad populations  --------------------
-    logger.info("Computing MAF from gnomAD populations")
-    gnomad_cols = [
-        c for c in annos.collect_schema().names()
-        if c.startswith(("gnomadg_af_"))
-    ]
-    annos = annos.with_columns(
-        maf_gnomad=pl.max_horizontal(
-            [pl.col(c).cast(pl.Float32, strict=False) for c in gnomad_cols]
-        )
-    )
+    # maf_gnomad is computed in concat_annotations (raw gnomadg_* already dropped)
 
     tmp = Path(output_path).with_suffix(".stage1.parquet")
     annos.sink_parquet(tmp, engine="streaming")
-    gnomad_cols = [
-        c for c in annos.collect_schema().names()
-        if c.startswith(("gnomadg_"))
-    ]
     annos = pl.scan_parquet(tmp)
-    annos = annos.drop(gnomad_cols)
 
     #-------- was not run with --total_length, so cds_position is just the start (or range) of the variant in the CDS
         # ── GENCODE v49 GTF (VEP 115) ─────────────────────────────────────────
     logger.info(f"Loading GTF {gtf_path}")
-    gtf = _load_gtf_polars(gtf_path) # TODO: add gene and transcript option
-    genes = _gtf_gene_features(gtf)
+    gtf = _load_gtf_polars(gtf_path)
+    genes_df = _gtf_region_features(gtf, region="gene")
+    transcripts_df = _gtf_region_features(gtf, region="transcript")
     tx_cds_len = _gtf_transcript_cds_length(gtf)
     del gtf
     gc.collect()
     logger.info(
-        f"  GTF: {genes.height} protein-coding genes, "
+        f"  GTF: {genes_df.height} protein-coding genes, "
+        f"{transcripts_df.height} transcripts, "
         f"{tx_cds_len.height} transcripts with CDS"
     )
 
-    # ── relative_cds_position: cds_start / total CDS length ───────────────
+    # ── relative_cds_position: cds_start / total CDS length ─────────────────────
     # As in add_more_annotations.py, but the CDS length is per transcript
-    # (joined on `feature`), because there is one row per transcript.
+    # (joined on 'feature'), because there is one row per transcript.
     logger.info("Computing relative CDS positions (cds_start / GTF CDS length)")
     annos = (
         _idempotent_join(
-            annos.with_columns(_tx=_tx_key()), tx_cds_len.lazy(),
-            on=["_tx"], validate="m:1",
+            annos.with_columns(_tx=_tx_key()),
+            tx_cds_len.lazy(), on=["_tx"],validate="m:1",
         )
         .with_columns(
             relative_cds_position=(
                 _cds_start_expr().cast(pl.Float64)
-                / pl.col("cds_length").cast(pl.Float64)
-            ).clip(0.0, 1.0).round(4).cast(pl.Float32)
+                / pl.col("cds_length_incl_stop").cast(pl.Float64)
+            )
+            .clip(0.0, 1.0).round(4).cast(pl.Float32)
         )
         .drop("_tx")
-        # keep cds_length — also used by next_in_frame
+        # keep cds_length – also used by next in frame
     )
     match_rate = (
         annos.filter(pl.col("cds_position").is_not_null())
-        .select(pl.col("cds_length").is_not_null().mean())
+        .select(pl.col("cds_length_incl_stop").is_not_null().mean())
         .collect()
         .item()
     )
-    logger.info(f"  CDS length found for {match_rate:.1%} of rows with cds_position")
+    logger.info(f"  CDS length found for {match_rate} of rows with cds_position")
 
-    # ── next_in_frame_relative (start_lost SNVs only) ────────────────────
-    logger.info("Processing start_lost variants for next in-frame ATG")
+    # ── next_in_frame_relative (start_lost SNVs only) ───────────────────────────
+    logger.info("Processing start_lost variants for next in frame ATG")
     annos = _compute_next_in_frame(annos, tx_cds_len, fasta_path)
 
-
-    # ── Relative CDS position ─────────────────────────────────────────────
-    # does not work this way, as not run with --total_length
-    # logger.info("Computing relative CDS positions")
-    # sites = (
-    #     annos.with_columns(cds_parts=pl.col("cds_position").str.split("/"))
-    #     .with_columns(
-    #         length=pl.col("cds_parts").list.get(1),
-    #         protein_pos=pl.col("cds_parts").list.get(0),
-    #     )
-    #     .with_columns(
-    #         pl.col("protein_pos")
-    #         .map_elements(convert_to_int_and_get_max, return_dtype=pl.Int64)
-    #         .alias("protein_pos")
-    #     )
-    #     .filter(pl.col("protein_pos").is_not_null())
-    #     .with_columns(pl.col("length").cast(pl.Int64))
-    #     .with_columns(
-    #         (pl.col("protein_pos") / pl.col("length"))
-    #         .round(2)
-    #         .alias("relative_cds_position")
-    #     )
-    # )
-    # cds_merged = annos.select("id", "gene", "feature").join(
-    #     sites.select("id", "gene", "feature", "relative_cds_position"),
-    #     on=["id", "gene", "feature"],
-    #     how="left",
-    # )
-    # annos = annos.join(cds_merged, on=["id", "gene", "feature"], how="left", validate="1:1")
-
-    # ── Start-lost: next in-frame ATG ─────────────────────────────────────
-    # logger.info("Processing start_lost variants for next in-frame ATG")
-    # schema_names = annos.collect_schema().names()
-    # if "consequence_start_lost" in schema_names:
-    #     vep_start_lost = (
-    #         annos.filter(pl.col("consequence_start_lost") == 1)
-    #         .select(
-    #             [
-    #                 "pos",
-    #                 "chrom",
-    #                 "gene",
-    #                 "id",
-    #                 "cds_position",
-    #                 "codons",
-    #                 "strand",
-    #                 "allele",
-    #             ]
-    #         )
-    #         .collect()
-    #         .to_pandas()
-    #     )
-    #     vep_start_lost_snv = vep_start_lost[
-    #         vep_start_lost["allele"].str.len() == 1
-    #     ].copy()
-    #     vep_start_lost_snv[["variant_pos_cds", "cds_length"]] = vep_start_lost_snv[
-    #         "cds_position"
-    #     ].str.split("/", expand=True)
-    #     vep_start_lost_snv = vep_start_lost_snv[
-    #         vep_start_lost_snv["variant_pos_cds"].str.len() == 1
-    #     ]
-    #     vep_start_lost_snv["variant_pos_cds"] = vep_start_lost_snv[
-    #         "variant_pos_cds"
-    #     ].astype(int)
-    #     vep_start_lost_snv["cds_length"] = vep_start_lost_snv["cds_length"].astype(int)
-    #     vep_start_lost_snv["Chromosome"] = vep_start_lost_snv["chrom"].str.replace(
-    #         r"^(?!chr)", "chr", regex=True
-    #     )
-
-    #     logger.info(f"Processing {len(vep_start_lost_snv)} start_lost SNVs")
-    #     strands_pos = get_regions_positive_strand(vep_start_lost_snv, fasta_path)
-    #     strands_neg = get_regions_negative_strand(vep_start_lost_snv, fasta_path)
-    #     start_lost_df = pd.concat([strands_pos, strands_neg])
-    #     start_lost_df["next_in_frame"] = start_lost_df.apply(
-    #         lambda x: next_inframe_start_codon_distance(x["seq"], search_init=3), axis=1
-    #     )
-    #     start_lost_df["next_in_frame_relative"] = (
-    #         start_lost_df["next_in_frame"] / start_lost_df["cds_length"]
-    #     )
-    #     start_lost_df.loc[
-    #         start_lost_df["next_in_frame_relative"] < 0, "next_in_frame_relative"
-    #     ] = 1
-    #     start_lost_pl = pl.DataFrame(
-    #         start_lost_df[["gene", "id", "next_in_frame_relative"]]
-    #     )
-    #     annos = annos.join(
-    #         start_lost_pl.lazy(), on=["id", "gene", "feature"], how="left", validate="1:1"
-    #     )
-
-    # # ── SpliceAI max delta score ───────────────────────────────────────────
-    # logger.info("Processing SpliceAI predictions")
-    # if "spliceai_pred" in annos.collect_schema().names():
-    #     annos = annos.with_columns(
-    #         pl.col("spliceai_pred")# there are multiple predictions
-    #         .str.split("|")
-    #         .list.slice(1, 4)
-    #         .list.eval(pl.element().cast(pl.Float32, strict=False))
-    #         .list.max()
-    #         .alias("spliceai_delta_score")
-    #     ).drop("spliceai_pred")
+    #NOTE: new: if region is gene: now filter
+    if region == "gene":
+        logger.info("Filtering to one transcript per gene (VEP pick_order)")
+        annos = vep_per_gene(annos, length_col="cds_length_incl_stop", variant_cols=["chrom", "pos", "ref", "alt"])
 
      # ── SpliceAI max delta score ───────────────────────────────────────────
     # SpliceAI comes as separate columns: spliceai_pred_ds_{ag,al,dg,dl} (delta scores, 0-1) and spliceai_pred_dp_{ag,al,dg,dl} (positions). 
@@ -885,32 +973,20 @@ def process_vep(
             .drop(["_ref_aa", "_alt_aa"])
         )
 
-    # ── 5' UTR dummies ────────────────────────────────────────────────────
-    # have only: 5utr_annotation, 5utr_consequence
-    # logger.info("Processing 5' UTR variant consequence annotations")
-    # if "five_prime_utr_variant_consequence" in annos.collect_schema().names():
-    #     utr_df = annos.select(
-    #         "id", "gene", "five_prime_utr_variant_consequence"
-    #     ).with_row_index("row_nr")
-    #     dummies = (
-    #         utr_df.select(["row_nr", "five_prime_utr_variant_consequence"])
-    #         .with_columns(pl.col("five_prime_utr_variant_consequence").str.split("&"))
-    #         .explode("five_prime_utr_variant_consequence")
-    #         .filter(
-    #             pl.col("five_prime_utr_variant_consequence").is_not_null()
-    #             & (pl.col("five_prime_utr_variant_consequence") != "")
-    #         )
-    #         .collect()
-    #         .to_dummies(columns="five_prime_utr_variant_consequence")
-    #         .group_by("row_nr")
-    #         .max()
-    #     )
-    #     utr_df = (
-    #         utr_df.select("id", "gene", "row_nr")
-    #         .join(dummies.lazy(), on="row_nr", how="left")
-    #         .drop("row_nr")
-    #     )
-    #     annos = annos.join(utr_df, on=["id", "gene"], how="left", validate="1:1")
+    #── 5' UTR dummies ────────────────────────────────────────────────────
+    logger.info("Processing 5' UTR variant consequence annotations")
+    C = "five_prime_utr_variant_consequence"
+    if "5utr_consequence" in annos.collect_schema().names():
+        annos = annos.with_row_index("_row")
+        dummies = (
+            annos.select("_row", pl.col("5utr_consequence").str.split("&").alias(C))
+            .explode(C)
+            .filter(pl.col(C).is_not_null() & (pl.col(C) != ""))
+            .collect()
+            .to_dummies(columns=C)
+            .group_by("_row").max()
+        )
+        annos = annos.join(dummies.lazy(), on="_row", how="left", validate="1:1").drop("_row")
 
     # ── Variant length / indel flags ──────────────────────────────────────
     logger.info("Computing variant lengths and indel flags")
@@ -928,30 +1004,12 @@ def process_vep(
         ).cast(pl.Int8),
     )
 
-    # ── Set region = transcript/feature (transcript-specific TSS) ─────────
-    annos = annos.with_columns(region=pl.col(region))
-
     # ── Distance to TSS ───────────────────────────────────────────────────
-    logger.info("Calculating distance to TSS")
-    gencode_pr = pr.read_gtf(gtf_path, as_df=True)
-    gencode_pl = pl.from_pandas(gencode_pr).filter(
-        pl.col("gene_type").is_in(biotypes)
-    )
-    gencode_genes = gencode_pl.filter(pl.col("Feature") == region).with_columns(
-        region=pl.col(f"{region}_id").str.split(".").list.first()
-    )
-    tss_df = gencode_genes.with_columns(
-        gene_length=pl.col("End") - pl.col("Start") + 1,
-        tss=pl.when(pl.col("Strand") == "+")
-        .then(pl.col("Start"))
-        .otherwise(pl.col("End")),
-    ).select(["tss", "Strand", "gene_length", "region"]).unique(subset="region")
- 
-
+    annos = annos.with_columns(region=pl.col("feature"))
     logger.info("Joining distance to transcript-specific TSS")
     anno_tss = (
         annos.select(["id", "pos", "region"])
-        .join(tss_df.lazy(), on="region", how="left")
+        .join(transcripts_df.lazy(), on="region", how="left")
         .with_columns(
             dist_to_tss=pl.when(pl.col("Strand") == "+")
             .then(pl.col("pos") - pl.col("tss"))
@@ -960,8 +1018,10 @@ def process_vep(
         # .collect(engine="streaming")
     )
     anno_tss = anno_tss.rename({col: col.lower() for col in anno_tss.columns})
-    annos = annos.join(anno_tss.lazy(), on=["id", "pos", "region"], how="left")
-    annos = annos.unique(subset=["id", "gene", "region"])
+    annos = annos.join(anno_tss.lazy(), on=["id", "pos", "region", "strand"], how="left")
+
+    # ── Set region = transcript/feature (transcript-specific TSS), can be gene if chosen ─────────
+    annos = annos.with_columns(region=pl.col(region))
 
     logger.info(f"Writing VEP-processed annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1018,14 +1078,7 @@ def merge_gpn_msa(variant_metadata_path, scores_gpn_msa_file, output_path):
 
 def merge_all_pre_cadd(
     vep_processed_path,
-    # absplice2_path,
     gpn_msa_path,
-    # abexp_path,
-    # protein_domains_path,
-    # cpt1_path,
-    # promoter_ai_file,
-    # pai3_file,
-    # encode_path,
     output_path,
 ):
     """
@@ -1035,17 +1088,7 @@ def merge_all_pre_cadd(
     Writes to output_path (the pre-CADD intermediate).
     """
     logger.info("Loading VEP-processed annotations")
-    # chrX PAR-region variants can appear twice in VEP output (only tss /
-    # dist_to_tss may differ between copies).  Deduplicate eagerly so all
-    # downstream 1:1 join validations pass.
-    # sanity checked this using
-    # annos = pl.read_parquet(vep_processed_path)
-    # cnts = annos.group_by('id', 'gene').len().sort('len')
-    # annos.join(cnts.filter(pl.col('len') > 1).select('id'), on='id', how='semi') \
-    #     .sort("id") \
-    #     .select(['id', 'gene', 'feature', 'chrom', 'pos', 'dist_to_tss'])\
-    #     .select('chrom').unique()
-    # # only returns X
+    
     annos = (
         pl.read_parquet(vep_processed_path)
         .sort("dist_to_tss", nulls_last=True)
@@ -1053,157 +1096,10 @@ def merge_all_pre_cadd(
         .lazy()
     )
 
-    # ── AbSplice2 ─────────────────────────────────────────────────────────
-    # logger.info("Merging AbSplice2 scores")
-    # # AbSplice2 also has fully-identical duplicate rows for chrX PAR variants.
-    # absplice2 = pl.scan_parquet(absplice2_path).unique()
-    # annos = annos.join(
-    #     absplice2,
-    #     on=["chrom", "pos", "ref", "alt", "gene"],
-    #     how="left",
-    #     validate="1:1",
-    # ).rename({col: col.lower() for col in absplice2.collect_schema().names()})
-
     # ── GPN-MSA ───────────────────────────────────────────────────────────
     logger.info("Merging GPN-MSA scores")
     gpn_msa = pl.scan_parquet(gpn_msa_path)
     annos = annos.join(gpn_msa, on="id", how="left", validate="m:1")
-
-    # # ── AbExp ─────────────────────────────────────────────────────────────
-    # logger.info("Merging AbExp scores")
-    # abexp = pl.scan_parquet(abexp_path).drop(["chrom", "ref", "alt", "pos"])
-    # annos = annos.join(abexp, on=["id", "region"], how="left", validate="1:1")
-
-    # # ── PromoterAI ────────────────────────────────────────────────────────
-    # logger.info("Merging PromoterAI scores")
-    # promoter_ai = (
-    #     pl.scan_parquet(promoter_ai_file)
-    #     .with_columns(
-    #         pl.concat_str(
-    #             [
-    #                 pl.col("chrom"),
-    #                 pl.col("pos").cast(pl.Utf8),
-    #                 pl.col("ref"),
-    #                 pl.col("alt"),
-    #             ],
-    #             separator=":",
-    #         ).alias("id")
-    #     )
-    #     .rename({"gene": "gene_name", "gene_id": "gene", "promoterAI": "promoterai"})
-    #     .with_columns(pl.col("promoterai").abs().alias("promoterai_abs"))
-    #     .select("promoterai", "promoterai_abs", "id", "gene")
-    # )
-    # scores = annos.select("gene", "id").join(
-    #     promoter_ai, how="left", on=["id", "gene"], validate="1:m"
-    # )
-    # scores_grouped = scores.group_by(["gene", "id"]).agg(
-    #     pl.col("promoterai").sort_by(pl.col("promoterai_abs"), descending=True).first()
-    # )
-    # annos = annos.join(
-    #     scores_grouped.select("promoterai", "id", "gene"),
-    #     how="left",
-    #     on=["id", "gene"],
-    #     validate="1:1",
-    # )
-
-    # # ── PrimateAI-3D ─────────────────────────────────────────────────────
-    # logger.info("Merging PrimateAI-3D scores")
-    # paidf = pl.scan_parquet(pai3_file)
-    # annos = annos.join(paidf, how="left", on=["id", "feature"], validate="1:1")
-
-    # # ── Protein domains ───────────────────────────────────────────────────
-    # logger.info("Merging protein domain annotations")
-    # all_domains = pl.read_parquet(protein_domains_path)
-    # schema_names = annos.collect_schema().names()
-
-    # if "protein_position" in schema_names:
-    #     anno_coding = (
-    #         annos.select(["id", "region", "protein_position"])
-    #         .drop_nulls("protein_position")
-    #         .with_columns(pos_raw=pl.col("protein_position").str.split("/").list.get(0))
-    #         .with_columns(split_struct=pl.col("pos_raw").str.split_exact("-", 1))
-    #         .with_columns(
-    #             aa_start=pl.col("split_struct")
-    #             .struct.field("field_0")
-    #             .cast(pl.Int32, strict=False),
-    #             aa_end=pl.col("split_struct")
-    #             .struct.field("field_1")
-    #             .fill_null(pl.col("split_struct").struct.field("field_0"))
-    #             .cast(pl.Int32, strict=False),
-    #         )
-    #         .select(["id", "region", "aa_start", "aa_end"])
-    #         .collect()
-    #     )
-
-    #     overlap_df = (
-    #         anno_coding.lazy()
-    #         .join(all_domains.lazy(), on="region", how="inner")
-    #         .filter(
-    #             (
-    #                 (pl.col("aa_start") <= pl.col("domain_end"))
-    #                 & (pl.col("aa_start") >= pl.col("domain_start"))
-    #             )
-    #             | (
-    #                 (pl.col("aa_end") <= pl.col("domain_end"))
-    #                 & (pl.col("aa_end") >= pl.col("domain_start"))
-    #             )
-    #         )
-    #         .group_by(["id", "region", "aa_start", "aa_end"])
-    #         .agg(
-    #             pl.col("mobi_full_disorder_priority").max(),
-    #             pl.col("mobi_curated_disorder_priority").max(),
-    #             pl.col("mobi_full_lip_priority").max(),
-    #             pl.col("ted_domain").max(),
-    #             pl.col("low_complexity_domain").max(),
-    #         )
-    #         # Collapse to unique (id, region) pairs
-    #         .group_by(["id", "region"])
-    #         .agg(
-    #             pl.col("mobi_full_disorder_priority").max(),
-    #             pl.col("mobi_curated_disorder_priority").max(),
-    #             pl.col("mobi_full_lip_priority").max(),
-    #             pl.col("ted_domain").max(),
-    #             pl.col("low_complexity_domain").max(),
-    #         )
-    #         .collect()
-    #     )
-
-    #     domain_annos = (
-    #         annos.select(["id", "region"])
-    #         .join(overlap_df.lazy(), on=["id", "region"], how="left")
-    #         .with_columns(
-    #             pl.col("mobi_full_disorder_priority").fill_null(False),
-    #             pl.col("mobi_curated_disorder_priority").fill_null(False),
-    #             pl.col("mobi_full_lip_priority").fill_null(False),
-    #             pl.col("ted_domain").fill_null(False),
-    #             pl.col("low_complexity_domain").fill_null(False),
-    #         )
-    #     )
-    #     annos = annos.join(
-    #         domain_annos, on=["id", "region"], how="left", validate="1:1"
-    #     )
-
-    # # ── CPT-1 ─────────────────────────────────────────────────────────────
-    # logger.info("Merging CPT-1 scores")
-    # cpt1_scores = pl.scan_parquet(cpt1_path)
-    # if (
-    #     "protein_position" in annos.collect_schema().names()
-    #     and "amino_acids" in annos.collect_schema().names()
-    # ):
-    #     annos = (
-    #         annos.with_columns(
-    #             prot_pos=pl.col("protein_position").str.split("/").list.get(0)
-    #         )
-    #         .join(cpt1_scores, on=["region", "amino_acids", "prot_pos"], how="left")
-    #         .drop("prot_pos")
-    #     )
-
-    # # ── ENCODE ────────────────────────────────────────────────────────────
-    # # ENCODE is position-based (not gene-specific) → join on id only.
-    # logger.info("Merging ENCODE cCRE annotations")
-    # encode_bool_cols = list(CCRE_COLUMN_MAP.values())
-    # encode_df = pl.scan_parquet(encode_path).select(["id"] + encode_bool_cols)
-    # annos = annos.join(encode_df, on="id", how="left", validate="m:1")
 
     logger.info(f"Writing pre-CADD annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1211,58 +1107,7 @@ def merge_all_pre_cadd(
     logger.info("Pre-CADD merge complete")
 
 
-# ── Step 4: CADD ───────────────────────────────────────────────────────────
-
-
-def merge_cadd(nocadd_path, cadd_file, annotation_columns, output_path):
-    """
-    Merge CADD scores and write the final annotation file.
-    Casts all float64 columns to float32 to reduce disk size.
-    """
-    logger.info("Loading pre-CADD annotations")
-    gc.collect()
-    annos = pl.scan_parquet(nocadd_path)
-
-    logger.info(f"Loading CADD scores from {cadd_file}")
-    cadd = (
-        pl.scan_parquet(cadd_file)
-        .with_columns(
-            pl.concat_str(
-                [
-                    "chr" + pl.col("#Chrom"),
-                    pl.col("Pos"),
-                    pl.col("Ref"),
-                    pl.col("Alt"),
-                ],
-                separator=":",
-            ).alias("id"),
-            pl.col("GeneID").alias("region"),
-        )
-        .drop(["#Chrom", "Pos", "Ref", "Alt", "GeneID"])
-    )
-    to_lower_renamer = {i: i.lower() for i in cadd.columns}
-    cadd = cadd.rename(to_lower_renamer)
-    col_set = list(set(["id", "region"] + annotation_columns))
-    col_set = [col for col in col_set if col in cadd.columns]
-    logger.info(f"Joining columns from cadd: {col_set}")
-    gene_set = set(annos.select(pl.col("region").unique()).collect().to_series())
-    logger.info(f"Filtering CADD for {len(gene_set)} genes")
-    cadd_small = cadd.select(*col_set).filter(pl.col("region").is_in(gene_set))
-
-    logger.info("Joining CADD scores")
-    annos = annos.join(cadd_small, on=["id", "region"], how="left")
-    annos = annos.rename({col: col.lower() for col in annos.collect_schema().names()})
-
-    logger.info("Casting float64 columns to float32")
-    float64_cols = [name for name, dtype in annos.schema.items() if dtype == pl.Float64]
-    annos = annos.with_columns([pl.col(c).cast(pl.Float32) for c in float64_cols])
-
-    logger.info(f"Writing final annotations to {output_path}")
-    annos.sink_parquet(output_path, engine="streaming")
-    logger.info("Done")
-
-
-# ── Step 5: Fill nulls ──────────────────────────────────────────────────────
+# ── Step 4: Fill nulls ──────────────────────────────────────────────────────
 
 
 def fill_nulls(input_path, annotation_specs, cols_to_keep, output_path):
@@ -1393,7 +1238,9 @@ def main(config_path, config_general_path):
     logger.info(f"OUT_CADD: {OUT_CADD}")
     logger.info(f"OUT_CADD_NA: {OUT_CADD_NA}")
 
-    concat_annotations(SHARDS_DIR, OUT_CONCAT_ANNOTATIONS)
+    concat_annotations(
+        SHARDS_DIR, OUT_CONCAT_ANNOTATIONS, config_general["gene_filters"]
+    )
     write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
     process_vep(
         OUT_CONCAT_ANNOTATIONS,
@@ -1408,10 +1255,6 @@ def main(config_path, config_general_path):
     # YET TO DO
     merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
     merge_all_pre_cadd(OUT_PROCESS_VEP, OUT_GPN_MSA, OUT_PRE_CADD)
-    # merge_cadd(nocadd_path  = input.nocadd,
-    #         cadd_file    = input.cadd,
-    #         annotation_columns = config["annotation_columns"],
-    #         output_path  = output[0],)
     fill_nulls(
         input_path         = OUT_PRE_CADD,
         annotation_specs = config_general["annotation_specs"],

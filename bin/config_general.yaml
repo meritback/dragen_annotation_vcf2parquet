@@ -14,9 +14,9 @@ gene_filters:
   # generated in deeprvat_wgs/bcf2parquet/2_create_input_batch_files.ipynb
   # genes_to_keep_file: /s/project/deeprvat_wgs/input_data/bcf2parquet/consolidated_file_lists/batch_1_covered_regions.parquet
 
-region: gene   # to do: enable transcript
+region: gene   # or transcript
 
-annotation_columns: #cols_to_keep:
+annotation_columns: #cols_to_keep, except for consequence cols:
   - id
   - chrom
   - pos
@@ -26,6 +26,9 @@ annotation_columns: #cols_to_keep:
   - gene
   - maf_cohort
   - maf_gnomad
+  - AC
+  - max_af
+  - max_af_pops
   - cadd_phred
   - cadd_raw
   - next_in_frame_relative
@@ -35,12 +38,32 @@ annotation_columns: #cols_to_keep:
   - is_plof
   - loftee_hc
   - loftee_lc
+  - cds_length_incl_stop
+  - cds_length
+  - variant_length
   - relative_cds_position
   - blosum62
+  - five_prime_utr_variant_consequence_5_prime_UTR_premature_start_codon_gain_variant
+  - five_prime_utr_variant_consequence_5_prime_UTR_premature_start_codon_loss_variant
+  - five_prime_utr_variant_consequence_5_prime_UTR_uORF_frameshift_variant
+  - five_prime_utr_variant_consequence_5_prime_UTR_uORF_stop_codon_gain_variant
+  - five_prime_utr_variant_consequence_5_prime_UTR_uORF_stop_codon_loss_variant
+  - is_indel
+  - is_insertion
+  - is_deletion
+  - region_length
+  - tss
+  - dist_to_tss
+  - clinvar
+  
+
 
 annotation_specs:
   maf_cohort: [0]
   maf_gnomad: [0]
+  AC: [0]
+  max_af: [0]
+  max_af_pops: [0]
   cadd_phred: [0]
   cadd_raw: [0.28051]
   next_in_frame_relative: [0]
@@ -52,3 +75,18 @@ annotation_specs:
   loftee_lc: [0]
   relative_cds_position: [0]
   blosum62: [0]
+  five_prime_utr_variant_consequence_5_prime_UTR_premature_start_codon_gain_variant: [0]
+  five_prime_utr_variant_consequence_5_prime_UTR_premature_start_codon_loss_variant: [0]
+  five_prime_utr_variant_consequence_5_prime_UTR_uORF_frameshift_variant: [0]
+  five_prime_utr_variant_consequence_5_prime_UTR_uORF_stop_codon_gain_variant: [0]
+  five_prime_utr_variant_consequence_5_prime_UTR_uORF_stop_codon_loss_variant: [0]
+  # cds_length_incl_stop
+  # cds_length
+  # variant_length
+  # is_indel
+  # is_insertion
+  # is_deletion
+  # region_length
+  # tss
+  # dist_to_tss
+  # clinvar
