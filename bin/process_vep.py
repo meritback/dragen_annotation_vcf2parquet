@@ -233,47 +233,6 @@ def _gtf_region_features(gtf: pl.DataFrame, region="transcript", biotypes=["prot
         .unique(subset=["region"])
     )
 
-def _gtf_mane_tss(gtf: pl.DataFrame) -> pl.DataFrame:
-    """Per-gene TSS of the MANE Select transcript (GTF 'transcript' rows).
- 
-    For genes with no MANE Select transcript, falls back to the transcript
-    tagged Ensembl_canonical. Used for dist_to_tss_v39 against a GENCODE v39
-    GTF so the promoter region matches PromoterAI's benchmark definition.
- 
-    Returns one row per gene: region, _tss_v49, _gene_strand_v49.
-    """
-    tx = (
-        gtf.filter(pl.col("feature") == "transcript")
-        .with_columns(
-            region=pl.col("attributes").str.extract(r'gene_id "([^"]+)"')
-                  .str.split(".").list.first(),
-            gene_type=pl.col("attributes")
-                  .str.extract(r'gene_(?:type|biotype) "([^"]+)"'),
-            _is_mane=pl.col("attributes").str.contains(r'tag "MANE_Select"'),
-            _is_canonical=pl.col("attributes")
-                  .str.contains(r'tag "Ensembl_canonical"'),
-            _tss_v49=pl.when(pl.col("strand") == "+")
-                  .then(pl.col("start"))
-                  .otherwise(pl.col("end")),
-            _gene_strand_v49=pl.col("strand"),
-        )
-        # Same protein-coding restriction as _gtf_region_features: Ensembl_canonical
-        # (the fallback) also tags lncRNAs / pseudogenes, which are not in scope.
-        .filter(
-            (pl.col("gene_type") == "protein_coding")
-            & (pl.col("_is_mane") | pl.col("_is_canonical"))
-        )
-        # MANE Select wins over Ensembl_canonical; one transcript per gene.
-        .sort(["region", "_is_mane"], descending=[False, True])
-        .unique(subset=["region"], keep="first", maintain_order=True)
-    )
-    n_mane = int(tx.select(pl.col("_is_mane").sum()).item())
-    logger.info(
-        f"  v49 MANE/canonical TSS: {tx.height} genes "
-        f"({n_mane} MANE Select, {tx.height - n_mane} Ensembl_canonical fallback)"
-    )
-    return tx.select(["region", "_tss_v49", "_gene_strand_v49"])
-
 def _idempotent_join(
     left: pl.LazyFrame,
     right: pl.LazyFrame,
@@ -501,65 +460,6 @@ def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
         .unique(subset=["_tx"], keep="first", maintain_order=True)
         .select(["_tx", "cds_length", "cds_length_incl_stop"])
     )
-
-# EVA
-def get_regions_positive_strand(variant_df, fasta_path):
-    seqs_df = variant_df.query("strand == '1'").copy()
-    if seqs_df.empty:
-        for col, dtype in [("Start", np.int64), ("End", np.int64), ("index", np.int64)]:
-            seqs_df[col] = pd.Series(dtype=dtype)
-        seqs_df["Strand"] = pd.Series(dtype=object)
-        seqs_df["seq"] = pd.Series(dtype=object)
-        return seqs_df
-    seqs_df["Start"] = seqs_df["pos"] - seqs_df["variant_pos_cds"]
-    seqs_df["End"] = seqs_df["pos"] + 100
-    seqs_df["Strand"] = seqs_df["strand"].replace({1: "+", -1: "-"})
-    seqs_df["index"] = np.arange(len(seqs_df))
-    seqs_pr = pr.PyRanges(seqs_df)
-    seqs_pr.seq = pr.get_sequence(seqs_pr, path=fasta_path)
-    return seqs_pr.df.copy()
-
-
-def get_regions_negative_strand(variant_df, fasta_path):
-    seqs_df = variant_df.query("strand == '-1'").copy()
-    if seqs_df.empty:
-        for col, dtype in [("End", np.int64), ("Start", np.int64), ("index", np.int64)]:
-            seqs_df[col] = pd.Series(dtype=dtype)
-        seqs_df["Strand"] = pd.Series(dtype=object)
-        seqs_df["seq"] = pd.Series(dtype=object)
-        return seqs_df
-    seqs_df["End"] = seqs_df["pos"] + seqs_df["variant_pos_cds"] - 1
-    seqs_df["Start"] = seqs_df["End"] - seqs_df["cds_length_incl_stop"]
-    seqs_df["Strand"] = seqs_df["strand"].replace({1: "+", -1: "-"})
-    seqs_df["index"] = np.arange(len(seqs_df))
-    seqs_pr = pr.PyRanges(seqs_df)
-    seqs_pr.seq = pr.get_sequence(seqs_pr, path=fasta_path)
-    return seqs_pr.df.copy()
-
-
-def next_inframe_start_codon_distance(seq, search_init=0):
-    """Distance to the next in-frame ATG, or -1 if none found."""
-    pos = seq.find("ATG", search_init)
-    if pos == -1:
-        return -1
-    rel = pos - search_init
-    if rel % 3 == 0:
-        return pos
-    next_init = pos + (3 - rel % 3)
-    if next_init >= len(seq):
-        return -1
-    return next_inframe_start_codon_distance(seq, next_init)
-
-
-def convert_to_int_and_get_max(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        if value is None:
-            return None
-        parts = str(value).split("-")
-        ints = [int(v) for v in parts if v.isdigit()]
-        return max(ints) if ints else None
 
 # ---- RECREATION of TRANSCRIPT ORDER
 """
