@@ -395,36 +395,6 @@ def _cds_start_expr() -> pl.Expr:
     leading integer is cds_start ("?-125" -> null, like a missing cds_start).
     """
     return pl.col("cds_position").str.extract(r"^(\d+)").cast(pl.Int64)
- 
-# def _gtf_transcript_cds(gtf: pl.DataFrame) -> pl.DataFrame:
-#     """Per-transcript CDS segments from GTF 'CDS' rows.
-
-#     Returns one row per CDS segment: _tx, chrom, start, end, strand, _cds_start_nf.
-#     Unlike add_more_annotations.py (gene-level, which double-counts exons shared
-#     by isoforms), this is keyed by transcript, matching VEP's `feature` column.
-#     chrY PAR copies are dropped so each transcript maps to one chromosome.
-#     """
-#     cds = (
-#         gtf.filter(pl.col("feature") == "CDS")
-#         .with_columns(
-#             transcript_id=pl.col("attributes").str.extract(r'transcript_id "([^"]+)"'),
-#             _cds_start_nf=pl.col("attributes").str.contains(r'tag "cds_start_NF"'),
-#         )
-#         .filter(
-#             pl.col("transcript_id").is_not_null()
-#             & ~pl.col("transcript_id").str.ends_with("_PAR_Y")
-#         )
-#         .with_columns(_tx=_tx_key("transcript_id"))
-#     )
-#     tx_chrom = (
-#         cds.select("_tx", "chrom").unique()
-#         .sort(["_tx", pl.col("chrom") == "chrY"])
-#         .unique(subset="_tx", keep="first", maintain_order=True)
-#     )
-#     return (
-#         cds.join(tx_chrom, on=["_tx", "chrom"], how="semi")
-#         .select("_tx", "chrom", "start", "end", "strand", "_cds_start_nf")
-#     )
 
 def _gtf_transcript_cds_length(gtf: pl.DataFrame) -> pl.DataFrame:
     """Sum CDS exon lengths per transcript.
@@ -541,6 +511,11 @@ def vep_per_gene(lf, length_col="cds_length", pick_order=PICK_ORDER,
     variant_cols : columns identifying one VEP input variant
     """
     lf = pl.LazyFrame(lf) if isinstance(lf, pl.DataFrame) else lf
+    # VEP fields can arrive as ints (e.g. tsl=1) or all-null; the criteria expect strings
+    str_cols = ["biotype", "mane_select", "mane", "canonical", "appris",
+                "tsl", "ccds", "consequence", "source"]
+    schema = lf.collect_schema()
+    lf = lf.with_columns(pl.col(c).cast(pl.Utf8) for c in str_cols if c in schema)
     lf = lf.with_row_index("_row")          # original (VEP) order = final tie-break
 
     crit = dict(CRITERIA)
@@ -767,6 +742,17 @@ def process_vep(
         .alias("loftee_lc_is_na"),
     )
 
+    # ---- is_plof ------------- from #https://github.com/HolEv/deeprvat-rd/blob/790853f8113311cb03bc99a5198004cf96d756d6/solve_rd_preprocessing/6_deeprvat_variant_scores.ipynb#L638
+    PLOF_COLS=[
+        "consequence_stop_gained",
+        "consequence_frameshift_variant",
+        "consequence_stop_lost",
+        "consequence_start_lost",
+        "consequence_splice_acceptor_variant",
+        "consequence_splice_donor_variant",
+    ]
+    annos = annos.with_columns(is_plof=pl.any_horizontal([pl.col(c) for c in PLOF_COLS]).cast(pl.Int8))
+
     # ── MAF ───────────────────────────────────────────────────────────────
     logger.info("renaming MAF")
     annos = annos.rename({"af": "maf_cohort"})
@@ -917,11 +903,18 @@ def process_vep(
         )
         # .collect(engine="streaming")
     )
-    anno_tss = anno_tss.rename({col: col.lower() for col in anno_tss.columns})
+    anno_tss = anno_tss.rename({col: col.lower() for col in anno_tss.collect_schema().names()})
     annos = annos.join(anno_tss.lazy(), on=["id", "pos", "region", "strand"], how="left")
 
     # ── Set region = transcript/feature (transcript-specific TSS), can be gene if chosen ─────────
-    annos = annos.with_columns(region=pl.col(region))
+    if region=="transcript":
+        logger.info("choosing transcript-specific TSS (region=feature)")
+        annos = annos.with_columns(region=pl.col("feature"))
+    elif region=="gene":
+        logger.info("choosing gene-specific TSS (region=gene)")
+        annos = annos.with_columns(region=pl.col(region))
+    else:
+        raise ValueError(f"Invalid region: {region}. Must be 'gene' or 'transcript'.")
 
     logger.info(f"Writing VEP-processed annotations to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1142,15 +1135,16 @@ def main(config_path, config_general_path):
         SHARDS_DIR, OUT_CONCAT_ANNOTATIONS, config_general["gene_filters"]
     )
     write_variant_metadata(OUT_CONCAT_ANNOTATIONS, OUT_VAR_METADATA)
+    
     process_vep(
-        OUT_CONCAT_ANNOTATIONS,
-        OUT_VAR_METADATA,
-        FASTA_PATH,
-        GTF_PATH,
-        BLOSUM_PATH,
-        OUT_PROCESS_VEP,
-        config_general["gene_filters"],
-        config_general["region"],
+        annotation_file=OUT_CONCAT_ANNOTATIONS,
+        variant_metadata_file=OUT_VAR_METADATA,
+        fasta_path=FASTA_PATH,
+        gtf_path=GTF_PATH,
+        blosum_path=BLOSUM_PATH,
+        output_path=OUT_PROCESS_VEP,
+        gene_filters=config_general["gene_filters"],
+        region=config_general["region"],
     )
     # YET TO DO
     merge_gpn_msa(OUT_VAR_METADATA, GPN_MSA_SCORES, OUT_GPN_MSA)
