@@ -44,6 +44,24 @@
                 }
             }
         },
+        "region_and_type_filters": {
+            "title": "Region and variant type filters",
+            "description": "Optional, independent filters applied during extraction. Omit both and the pipeline runs unfiltered.",
+            "type": "object",
+            "properties": {
+                "region": {
+                    "type": "string",
+                    "format": "file-path",
+                    "description": "BED file of regions to keep, applied with bcftools view -R/--regions-file. REQUIRES a .tbi or .csi index next to every input VCF; the run fails loudly if an index is missing.",
+                    "help_text": "Because -R jumps through the index, every subshard VCF must have a .tbi/.csi next to it, otherwise the run aborts with '--region is set but no .tbi/.csi index was found next to ...'. With --region each annotations.parquet covers only the BED regions: use the same BED file for the whole run and record which one, or the subshards are not comparable."
+                },
+                "variant_type": {
+                    "type": "string",
+                    "description": "Comma-separated variant types to keep, e.g. 'snp' or 'snp,mnp'. Mapped to a bcftools TYPE include expression (--include 'TYPE=...').",
+                    "help_text": "Allowed values are the bcftools TYPE values: snp, indel, mnp, other, ref. Example: 'snp' keeps only single-nucleotide variants. Filtering happens at extraction time, so changing it means re-running; the alternative is filtering at query time on REF/ALT length or the consequence column."
+                }
+            }
+        },
         "annotation_options": {
             "title": "Annotation source",
             "type": "object",
@@ -78,6 +96,7 @@
     "allOf": [
         {"$ref": "#/definitions/input_output_options"},
         {"$ref": "#/definitions/subset_options"},
+        {"$ref": "#/definitions/region_and_type_filters"},
         {"$ref": "#/definitions/annotation_options"},
         {"$ref": "#/definitions/site_filters"}
     ]

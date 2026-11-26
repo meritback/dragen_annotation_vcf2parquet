@@ -33,6 +33,14 @@ params.vcf_name        = 'dragen.gel.annotated.vcf.gz'
 // which INFO field to expand; the other one is carried as a raw string column
 params.annotation_field = 'CSQ'
 
+// BED file of regions to keep, applied with bcftools view -R/--regions-file.
+// -R jumps through the index, so every input VCF must have a .tbi/.csi next to
+// it; the run fails loudly if one is missing.
+params.region         = null
+
+// variant types to keep, e.g. 'snp' or 'snp,mnp'; bcftools TYPE filter
+params.variant_type   = null
+
 // site filters, applied in bcftools during extraction
 params.max_af          = null
 params.max_ac          = null
@@ -52,6 +60,11 @@ def helpMessage() {
       --shards            Glob for shards            [${params.shards}]
       --subshards         Glob for subshards         [${params.subshards}]
       --annotation_field  INFO field to expand       [${params.annotation_field}]
+      --region            BED file; keep only these regions (bcftools -R).
+                          REQUIRES a .tbi/.csi index next to every VCF;
+                          the run fails if one is missing   [${params.region}]
+      --variant_type      Keep only these variant types, e.g. 'snp' or
+                          'snp,mnp' (bcftools TYPE)     [${params.variant_type}]
       --max_af            Drop sites above this AF   [${params.max_af}]
       --max_ac            Drop sites above this AC   [${params.max_ac}]
       --outdir            Publish directory          [${params.outdir}]
@@ -121,7 +134,7 @@ process CONVERT_ANNOTATIONS {
         saveAs: { fn -> fn == 'versions.yml' ? null : "${shard}/${subshard}/${fn}" }
 
     input:
-    tuple val(shard), val(subshard), path(vcf), path(idx)
+    tuple val(shard), val(subshard), path(vcf), path(idx), path(regions_bed)
 
     output:
     tuple val(shard), val(subshard), path("annotations.parquet"), emit: parquet
@@ -133,6 +146,8 @@ process CONVERT_ANNOTATIONS {
     script:
     def af_arg = params.max_af ? "--max-af ${params.max_af}" : ''
     def ac_arg = params.max_ac ? "--max-ac ${params.max_ac}" : ''
+    def region_arg = params.region ? "--regions-file ${regions_bed}" : ''
+    def vtype_arg  = params.variant_type ? "--variant-type '${params.variant_type}'" : ''
     """
     # Intermediate TSV stays in the task work dir: concurrent tasks never share
     # scratch. Same fix as the genotype pipeline's full-disk failures.
@@ -146,7 +161,15 @@ process CONVERT_ANNOTATIONS {
         ${vcf} annotations.parquet \\
         --columns-file columns.txt \\
         --annotation-field ${params.annotation_field} \\
-        ${af_arg} ${ac_arg} 2>&1 | tee convert.log
+        ${region_arg} ${vtype_arg} ${af_arg} ${ac_arg} 2>&1 | tee convert.log
+
+    # Record which BED/variant-type filter produced this parquet: the parquet
+    # itself does not say, and outputs from runs with different --region values
+    # are not comparable. md5sum captures which version of the BED was used.
+    if [ -n "${region_arg}" ]; then
+        echo "region_bed=${regions_bed} variant_type=${params.variant_type ?: 'none'}" >> convert.log
+        md5sum ${regions_bed} >> convert.log
+    fi
 
     # One short line per subshard instead of shipping 3100 column lists to a
     # single task. On awsbatch every staged input is a real download, so the
@@ -231,8 +254,10 @@ process CHECK_SCHEMA {
 // resolveSibling stays inside the file's own filesystem provider. Building the
 // path by string interpolation ("${vcf}.tbi") drops the s3:// scheme, and
 // Nextflow then looks for a local file that does not exist.
-// Returns null when neither index is present: without --region the VCFs are
-// read sequentially and bcftools does not need one.
+// Returns null when neither index is present: without --regions-file the VCFs
+// are read sequentially and bcftools does not need one. With params.region set
+// a missing index is a hard error (checked in the channel map below), because
+// -R/--regions-file jumps through the index.
 def indexFor(vcf) {
     for (ext in ['.tbi', '.csi']) {
         def idx = vcf.resolveSibling("${vcf.name}${ext}")
@@ -248,6 +273,21 @@ workflow {
     if (params.help) { helpMessage(); exit 0 }
     if (!params.annotation_root) { exit 1, "Missing --annotation_root" }
 
+    // Fail fast, before any of the ~3100 tasks is submitted.
+    if (params.region && !file(params.region).exists()) {
+        exit 1, "--region file not found: ${params.region}"
+    }
+    if (params.variant_type) {
+        def allowed = ['snp', 'indel', 'mnp', 'other', 'ref']
+        def bad = params.variant_type.split(',')
+                        .collect { it.trim().toLowerCase() }
+                        .findAll { it && !(it in allowed) }
+        if (bad) {
+            exit 1, "Unknown --variant_type value(s): ${bad.join(', ')}. " +
+                    "Allowed: ${allowed.join(', ')} (comma-separated)."
+        }
+    }
+
     ch_vcf = Channel
         .fromPath(
             "${params.annotation_root}/${params.shards}/${params.subshards}/${params.vcf_name}",
@@ -257,9 +297,19 @@ workflow {
             def sub_dir  = vcf.parent
             def subshard = sub_dir.name
             def shard    = sub_dir.parent.name
-            // Index optional: an empty list stages nothing, so a missing or
-            // stale index no longer kills the task.
-            tuple(shard, subshard, vcf, indexFor(vcf) ?: [])
+            def idx = indexFor(vcf)
+            // With --region the index is mandatory: -R/--regions-file cannot
+            // run without it, so fail loudly instead of skipping the subshard.
+            if (params.region && !idx) {
+                exit 1, "--region is set but no .tbi/.csi index was found " +
+                        "next to ${vcf}. bcftools -R requires one; re-index " +
+                        "the VCF or unset --region."
+            }
+            // Index optional otherwise: an empty list stages nothing, so a
+            // missing or stale index no longer kills the task. Same for the
+            // BED file: empty list stages nothing when --region is unset.
+            def bed = params.region ? file(params.region) : []
+            tuple(shard, subshard, vcf, idx ?: [], bed)
         }
 
     CONVERT_ANNOTATIONS(ch_vcf)

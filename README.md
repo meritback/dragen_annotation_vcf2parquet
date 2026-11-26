@@ -67,6 +67,36 @@ nextflow run . --help
 Run under `tmux` or `screen`. 3100 subshards is a long job and a dropped connection
 otherwise kills it — though `-resume` will pick it back up.
 
+### Subsetting by region or variant type
+
+Two optional, independent filters, applied during extraction. Omit both and the
+pipeline runs exactly as before.
+
+```bash
+# keep only the regions in a BED file (bcftools view -R/--regions-file)
+nextflow run . -profile docker --annotation_root ... --region regions.bed
+
+# keep only SNVs (bcftools TYPE filter, via --include 'TYPE="snp"')
+nextflow run . -profile docker --annotation_root ... --variant_type snp
+
+# both at once; comma-separated type list
+nextflow run . -profile docker --annotation_root ... --region regions.bed --variant_type snp,mnp
+```
+
+**`--region` requires an index.** `-R/--regions-file` jumps through the `.tbi`/`.csi`
+index, so every subshard VCF must have one next to it. If any is missing the run fails
+loudly (`--region is set but no .tbi/.csi index was found next to ...`) instead of
+silently skipping the subshard. The converter also checks this itself when called
+directly (`--regions-file` without an index exits with an error).
+
+Also note: with `--region`, each `annotations.parquet` covers only the BED regions —
+use the same BED file for the whole run, or the shards will not be comparable. Each
+subshard's `convert.log` records the BED used (name + md5) and the `--variant_type`,
+so a published output can always be traced back to its filter settings.
+`--variant_type` accepts the bcftools `TYPE` values
+(`snp`, `indel`, `mnp`, `other`, `ref`), comma-separated; unknown values fail before
+any task is submitted.
+
 ### Repository layout
 
 ```

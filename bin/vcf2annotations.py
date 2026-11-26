@@ -35,8 +35,7 @@ POS_DTYPE = pl.Int64
 # (CHROM:POS:REF:ALT) and the names would collide. rsIDs are in the CSQ
 # Existing_variation subfield anyway.
 FIXED_COLS = ["CHROM", "POS", "REF", "ALT", "QUAL", "FILTER", "AC", "AN", "AF"]
-FIXED_FMT = ("%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER"
-             "\t%INFO/AC\t%INFO/AN\t%INFO/AF")
+FIXED_FMT = "%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/AC\t%INFO/AN\t%INFO/AF"
 
 # The annotation field NOT being expanded, carried whole and unparsed as one
 # string column. split-vep expands one field per invocation, and CSQ (VEP) is
@@ -44,6 +43,28 @@ FIXED_FMT = ("%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER"
 # repeated on each CSQ row for that variant. Lossless; split it downstream if
 # you need it. ZSTD compresses the repetition to almost nothing.
 CARRY = {"CSQ": "ANN", "ANN": "CSQ"}
+
+# bcftools TYPE values accepted by --variant-type.
+VARIANT_TYPES = ["snp", "indel", "mnp", "other", "ref"]
+
+
+def type_exclude_term(variant_type: str) -> str:
+    """Build the bcftools --exclude term that keeps only the given TYPE values.
+
+    bcftools view accepts a single -i/-e expression, so the TYPE filter folds
+    into --exclude: a site is excluded when it matches none of the kept types,
+    i.e. TYPE!="snp" && TYPE!="indel" ... (note: !(TYPE="snp") does not parse,
+    and TYPE is not a string field, so !~ regex does not work either)."""
+    types = [t.strip().lower() for t in variant_type.split(",") if t.strip()]
+    unknown = [t for t in types if t not in VARIANT_TYPES]
+    if not types or unknown:
+        sys.exit(
+            f"Unknown --variant-type value(s): {unknown or variant_type}. "
+            f"Allowed: {', '.join(VARIANT_TYPES)} (comma-separated)."
+        )
+    term = " && ".join(f'TYPE!="{t}"' for t in types)
+    return f"({term})" if len(types) > 1 else term
+
 
 # Numeric casts. Everything is read as Utf8 first, so an unexpected value
 # becomes null instead of killing the job halfway through a shard.
@@ -81,10 +102,15 @@ ANN_COLUMNS = [
 ]
 
 
-def bcf_to_tsv(bcf_file: str, output_file, format_str: str,
-               annotation_field: str = "CSQ",
-               view_exclude: str | None = None,
-               region: str | None = None) -> None:
+def bcf_to_tsv(
+    bcf_file: str,
+    output_file,
+    format_str: str,
+    annotation_field: str = "CSQ",
+    view_exclude: str | None = None,
+    region: str | None = None,
+    regions_file: str | None = None,
+) -> None:
     """Expand the annotation field to TSV, one row per consequence.
 
     -a pins which INFO field is parsed. Without it split-vep auto-detects in
@@ -98,21 +124,28 @@ def bcf_to_tsv(bcf_file: str, output_file, format_str: str,
     -u  print '.' for tags missing from this file's header rather than failing,
         so a subshard missing INFO/AC does not take down the task
     -A tab  expand every subfield into its own column, in header order
+
+    regions_file is passed to bcftools view as -R/--regions-file, which jumps
+    through the index: it REQUIRES a .tbi/.csi next to the VCF (checked by the
+    caller). region (--regions) streams and needs no index.
     """
     region_arg = f"--regions '{region}' " if region else ""
+    regions_file_arg = f"--regions-file '{regions_file}' " if regions_file else ""
 
     pre = ""
-    if view_exclude or region_arg:
-        pre = f"{BCFTOOLS_PATH} view {region_arg}"
+    if view_exclude or region_arg or regions_file_arg:
+        pre = f"{BCFTOOLS_PATH} view {region_arg}{regions_file_arg}"
         if view_exclude:
             pre += f"--exclude '{view_exclude}' "
-        pre += f"-Ou \"{bcf_file}\" | "
+        pre += f'-Ou "{bcf_file}" | '
         src = "-"
     else:
         src = f'"{bcf_file}"'
 
-    cmd = (f"{pre}{BCFTOOLS_PATH} +split-vep -a {annotation_field} {src} "
-           f"-d -x -u -A tab --format '{format_str}'")
+    cmd = (
+        f"{pre}{BCFTOOLS_PATH} +split-vep -a {annotation_field} {src} "
+        f"-d -x -u -A tab --format '{format_str}'"
+    )
 
     print(f"Executing: {cmd}")
     proc = subprocess.run(cmd, shell=True, stdout=output_file)
@@ -140,14 +173,21 @@ def csq_columns(bcf_file: str, annotation_field: str = "CSQ") -> list:
     """
     out = subprocess.run(
         [BCFTOOLS_PATH, "+split-vep", "-a", annotation_field, "-l", bcf_file],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
     names = []
     # Reserve the fixed names and the ID column tsv_to_parquet appends, so a
     # CSQ subfield can never shadow a join key.
-    seen = ({c.lower() for c in FIXED_COLS} | set(FIXED_COLS)
-            | {"ID", "id"} | {k.lower() for k in CARRY} | set(CARRY))
+    seen = (
+        {c.lower() for c in FIXED_COLS}
+        | set(FIXED_COLS)
+        | {"ID", "id"}
+        | {k.lower() for k in CARRY}
+        | set(CARRY)
+    )
     for line in out.splitlines():
         # "<index>\t<name>"; take the name.
         parts = line.split("\t")
@@ -195,9 +235,7 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
 
     # Only add ANN fields that don't already exist among the CSQ/fixed columns.
     ann_only_cols = [
-        (i, name)
-        for i, name in enumerate(ANN_COLUMNS)
-        if name not in cols
+        (i, name) for i, name in enumerate(ANN_COLUMNS) if name not in cols
     ]
     try:
         df = pl.scan_csv(
@@ -219,28 +257,21 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
         df = df.with_columns(pl.col("CHROM").cast(CHROM_ENUM, strict=False))
         df = df.with_columns(
             pl.concat_str(
-                [pl.col("CHROM").cast(pl.Utf8), pl.col("POS").cast(pl.Utf8),
-                 pl.col("REF"), pl.col("ALT")],
+                [
+                    pl.col("CHROM").cast(pl.Utf8),
+                    pl.col("POS").cast(pl.Utf8),
+                    pl.col("REF"),
+                    pl.col("ALT"),
+                ],
                 separator=":",
             ).alias("ID")
         )
         if "ANN" in cols:
             df = (
-                df
-                .with_columns(
-                    pl.col("ANN")
-                    .str.split(",")
-                    .alias("_ann_record")
-                )
+                df.with_columns(pl.col("ANN").str.split(",").alias("_ann_record"))
                 .explode("_ann_record")
-
                 # Split each individual ANN record once into its 16 fields.
-                .with_columns(
-                    pl.col("_ann_record")
-                    .str.split("|")
-                    .alias("_ann_parts")
-                )
-
+                .with_columns(pl.col("_ann_record").str.split("|").alias("_ann_parts"))
                 # w/o those already available from CSQ.
                 .with_columns(
                     [
@@ -251,7 +282,6 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
                         for i, name in ann_only_cols
                     ]
                 )
-
                 .drop("_ann_record", "_ann_parts")
             )
 
@@ -263,16 +293,24 @@ def tsv_to_parquet(tsv_file: str, output_file: str, column_names: list):
 
 
 def check_bcftools():
-    if subprocess.call(f"type {BCFTOOLS_PATH}", shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+    if (
+        subprocess.call(
+            f"type {BCFTOOLS_PATH}",
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        != 0
+    ):
         sys.exit(f"Error: Could not find bcftools at '{BCFTOOLS_PATH}'.")
-    p = subprocess.run([BCFTOOLS_PATH, "plugin", "-l"],
-                       capture_output=True, text=True)
+    p = subprocess.run([BCFTOOLS_PATH, "plugin", "-l"], capture_output=True, text=True)
     out = p.stdout + p.stderr
     if "split-vep" not in out:
-        sys.exit("Error: bcftools +split-vep plugin not available.\n"
-                 f"BCFTOOLS_PLUGINS={os.environ.get('BCFTOOLS_PLUGINS', '<unset>')}\n"
-                 f"{out[:500]}")
+        sys.exit(
+            "Error: bcftools +split-vep plugin not available.\n"
+            f"BCFTOOLS_PLUGINS={os.environ.get('BCFTOOLS_PLUGINS', '<unset>')}\n"
+            f"{out[:500]}"
+        )
 
 
 @click.group()
@@ -284,27 +322,75 @@ def cli():
 @cli.command("convert_annotations")
 @click.argument("bcf_file", type=click.Path(exists=True))
 @click.argument("output_file", type=click.Path())
-@click.option("--columns-file", type=click.Path(), default=None,
-              help="Write the resolved column list here, one per line. The "
-                   "pipeline collects these and checks every subshard agrees: "
-                   "parquets with different schemas will not concatenate.")
-@click.option("--annotation-field", default="CSQ", show_default=True,
-              help="INFO field to expand. CSQ is VEP; ANN is SnpEff and much "
-                   "thinner. Whichever is not chosen is carried as a raw "
-                   "string column if it is in FIXED_FMT.")
+@click.option(
+    "--columns-file",
+    type=click.Path(),
+    default=None,
+    help="Write the resolved column list here, one per line. The "
+    "pipeline collects these and checks every subshard agrees: "
+    "parquets with different schemas will not concatenate.",
+)
+@click.option(
+    "--annotation-field",
+    default="CSQ",
+    show_default=True,
+    help="INFO field to expand. CSQ is VEP; ANN is SnpEff and much "
+    "thinner. Whichever is not chosen is carried as a raw "
+    "string column if it is in FIXED_FMT.",
+)
 @click.option("--region", default=None, help="e.g. chr1:1000000-1100000 (testing)")
-@click.option("--max-af", type=float, default=None,
-              help="Exclude sites with INFO/AF above this. At AggV3's cohort "
-                   "size this removes only a few percent of sites -- the site "
-                   "frequency spectrum is dominated by singletons -- so "
-                   "filtering at query time is usually the better trade.")
+@click.option(
+    "--regions-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="BED file of regions to keep. Passed to bcftools view as "
+    "-R/--regions-file, which jumps through the index: a .tbi "
+    "or .csi next to the VCF is required and this fails loudly "
+    "if none is found.",
+)
+@click.option(
+    "--variant-type",
+    default=None,
+    help="Comma-separated variant types to keep, e.g. 'snp' or "
+    "'snp,mnp'. Folded into the bcftools view --exclude "
+    "expression as 'TYPE!=...'. Allowed: snp, indel, mnp, "
+    "other, ref.",
+)
+@click.option(
+    "--max-af",
+    type=float,
+    default=None,
+    help="Exclude sites with INFO/AF above this. At AggV3's cohort "
+    "size this removes only a few percent of sites -- the site "
+    "frequency spectrum is dominated by singletons -- so "
+    "filtering at query time is usually the better trade.",
+)
 @click.option("--max-ac", type=int, default=None)
-def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
-                        annotation_field: str, region: str,
-                        max_af: float, max_ac: int):
+def convert_annotations(
+    bcf_file: str,
+    output_file: str,
+    columns_file: str,
+    annotation_field: str,
+    region: str,
+    regions_file: str,
+    variant_type: str,
+    max_af: float,
+    max_ac: int,
+):
     """Annotated VCF -> parquet. One row per variant per consequence."""
     check_bcftools()
     click.echo(f"Processing {bcf_file}...")
+
+    if regions_file:
+        # -R/--regions-file jumps through the index; without one bcftools
+        # fails with an opaque error, so check here and fail loudly instead.
+        if not any(os.path.exists(bcf_file + ext) for ext in (".tbi", ".csi")):
+            sys.exit(
+                f"--regions-file requires a .tbi/.csi index next to "
+                f"{bcf_file}; none found. Re-index the VCF or drop "
+                f"--regions-file."
+            )
+    type_term = type_exclude_term(variant_type) if variant_type else None
 
     carry = CARRY.get(annotation_field)
     csq = csq_columns(bcf_file, annotation_field)
@@ -317,8 +403,9 @@ def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
     column_names += csq
     format_str += f"\t%{annotation_field}\n"
 
-    click.echo(f"{annotation_field} subfields: {len(csq)}  "
-               f"total columns: {len(column_names)}")
+    click.echo(
+        f"{annotation_field} subfields: {len(csq)}  total columns: {len(column_names)}"
+    )
 
     if columns_file:
         with open(columns_file, "w") as fh:
@@ -331,15 +418,24 @@ def convert_annotations(bcf_file: str, output_file: str, columns_file: str,
         excl.append(f"INFO/AF>{max_af}")
     if max_ac is not None:
         excl.append(f"INFO/AC>{max_ac}")
+    if type_term:
+        # bcftools view accepts only ONE -i/-e expression, so the TYPE filter
+        # cannot be a separate --include: it folds into --exclude here.
+        excl.append(type_term)
     site_exclude = " || ".join(excl)
 
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as workdir:
         with tempfile.NamedTemporaryFile(mode="w+b", dir=workdir) as tmp:
             t0 = time.perf_counter()
-            bcf_to_tsv(bcf_file, tmp, format_str=format_str,
-                       annotation_field=annotation_field,
-                       view_exclude=site_exclude,
-                       region=region)
+            bcf_to_tsv(
+                bcf_file,
+                tmp,
+                format_str=format_str,
+                annotation_field=annotation_field,
+                view_exclude=site_exclude,
+                region=region,
+                regions_file=regions_file,
+            )
             tmp.flush()
             t1 = time.perf_counter()
             tsv_to_parquet(tmp.name, output_file, column_names)
